@@ -1,23 +1,15 @@
 """
-caselist_unified.py  –  PF Evidence Block Compiler
+caselist_unified.py  —  PF Evidence Block Compiler
 ====================================================
 Downloads open-source round files from OpenCaselist, filters to prestige
 tournaments, extracts 2AC/2NC rebuttal blocks, and compiles them into a
 clean PDF organized by argument — matching the Ultimate Prep Blockfile format.
 
-HOW IT WORKS:
-  Each debate .docx has this structure:
-    Heading 1  →  1AC  (constructive — SKIP)
-    Heading 1  →  2AC  (rebuttal — EXTRACT from here)
-      Heading 2  →  States          (argument group label)
-      Heading 3  →  AT: States      (block name  ← captured here)
-      Heading 4  →  1. Aff solves…  (card tag line)
-      Normal     →  Donnelly 23…    (card text)
-      Heading 3  →  AT: Antitrust   (next block)
-      ...
-
-  We skip 1AC/1NC entirely and only extract from 2AC/2NC/1AR/2AR/1NR.
-  All blocks with the same argument name are merged across every file/round.
+CARD FORMATTING (three-tier system):
+  Bold + Underline  →  size 11, bold, underlined      ← READ ALOUD (core warrant)
+  Underline only    →  size 11, underlined, not bold  ← supporting context
+  Plain text        →  size 8, plain                  ← filler / background
+  Highlight colors are preserved on top of any tier.
 
 REQUIREMENTS:
     pip install requests python-docx pypdf reportlab
@@ -34,6 +26,8 @@ from pathlib import Path
 import requests
 from docx import Document
 
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
@@ -53,19 +47,45 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 CASELIST_TOKEN = "375582f6bb7183c0cb5e6a8ce306a8c1"
 CASELIST       = "hspf25"
 
-# Only keep rounds from tournaments whose name contains one of these strings.
-# Set to [] to keep all tournaments.
+# Tournaments to INCLUDE (case-insensitive substring match).
+# Set to [] to include everything.
 TOURNAMENT_FILTER = ["Harvard", "Berkeley", "Stanford", "Bellaire", "Pennsbury"]
+
+# Tournaments to always EXCLUDE even if they match the filter above.
+TOURNAMENT_EXCLUDE = [
+    "Harvard College Debating Union Season Opener",
+    "Harvard Season Opener",
+    "Harvard HCDU",
+]
 
 OUTPUT_DIR = Path("caselist_output")
 CACHE_DIR  = OUTPUT_DIR / "cache"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
-C_BLUE     = HexColor("#1a5fa8")
-C_MUTED    = HexColor("#444444")
-C_LIGHT    = HexColor("#777777")
-C_RULE     = HexColor("#b8cce4")
-C_TAG_BG   = HexColor("#f0f5fc")
+C_BLUE    = HexColor("#1a5fa8")
+C_MUTED   = HexColor("#333333")
+C_LIGHT   = HexColor("#777777")
+C_RULE    = HexColor("#b8cce4")
+C_TAG_BG  = HexColor("#eef3fb")
+
+# ── Card font sizes ───────────────────────────────────────────────────────────
+SZ_READ    = 11   # Bold + underline  →  read aloud (core evidence)
+SZ_CONTEXT = 11   # Underline only    →  supporting context
+SZ_FILLER  =  8   # Plain             →  background / base text
+
+# ── Highlight color map  (WD_COLOR_INDEX name → hex) ─────────────────────────
+_HIGHLIGHT_COLORS = {
+    "YELLOW":       "#cce8ff",
+    "TURQUOISE":    "#cce8ff",
+    "BRIGHT_GREEN": "#cce8ff",
+    "PINK":         "#cce8ff",
+    "RED":          "#cce8ff",
+    "BLUE":         "#cce8ff",
+    "TEAL":         "#cce8ff",
+    "VIOLET":       "#cce8ff",
+    "DARK_YELLOW":  "#cce8ff",
+    "GREEN":        "#cce8ff",
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SETUP
@@ -73,6 +93,56 @@ C_TAG_BG   = HexColor("#f0f5fc")
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
+
+# ── Font registration (Calibri) ───────────────────────────────────────────────
+def _register_calibri():
+    """Register Calibri (or Carlito, its metric-identical open-source twin). Falls back to Helvetica."""
+    _candidates = {
+        "regular": [
+            Path("C:/Windows/Fonts/calibri.ttf"),
+            Path("C:/Windows/Fonts/Calibri.ttf"),
+            Path("/Library/Fonts/Calibri.ttf"),
+            Path.home() / "Library/Fonts/Calibri.ttf",
+            Path("/usr/share/fonts/truetype/msttcorefonts/calibri.ttf"),
+            Path("/usr/share/fonts/calibri.ttf"),
+            Path("/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf"),  # Calibri-identical
+        ],
+        "bold": [
+            Path("C:/Windows/Fonts/calibrib.ttf"),
+            Path("C:/Windows/Fonts/Calibrib.ttf"),
+            Path("/Library/Fonts/Calibri Bold.ttf"),
+            Path.home() / "Library/Fonts/Calibri Bold.ttf",
+            Path("/usr/share/fonts/truetype/msttcorefonts/calibrib.ttf"),
+            Path("/usr/share/fonts/calibrib.ttf"),
+            Path("/usr/share/fonts/truetype/crosextra/Carlito-Bold.ttf"),     # Calibri-identical
+        ],
+    }
+    reg_regular = reg_bold = False
+    for p in _candidates["regular"]:
+        if p.exists():
+            try:
+                pdfmetrics.registerFont(TTFont("Calibri", str(p)))
+                reg_regular = True
+                break
+            except Exception:
+                pass
+    for p in _candidates["bold"]:
+        if p.exists():
+            try:
+                pdfmetrics.registerFont(TTFont("Calibri-Bold", str(p)))
+                reg_bold = True
+                break
+            except Exception:
+                pass
+    if reg_regular and reg_bold:
+        from reportlab.pdfbase.pdfmetrics import registerFontFamily
+        registerFontFamily("Calibri", normal="Calibri", bold="Calibri-Bold",
+                           italic="Calibri", boldItalic="Calibri-Bold")
+        return "Calibri", "Calibri-Bold"
+    print("  [warn] Calibri not found on system — falling back to Helvetica.")
+    return "Helvetica", "Helvetica-Bold"
+
+FONT_NORMAL, FONT_BOLD = _register_calibri()
 
 API_BASE = "https://api.opencaselist.com/v1"
 session  = requests.Session()
@@ -97,7 +167,6 @@ def prompt_targets():
     print("  2. All teams in a school")
     print("  3. Recent rounds  (last N days, site-wide — slow)")
     print()
-
     choice = input("Choice [1]: ").strip() or "1"
 
     if choice == "2":
@@ -220,10 +289,16 @@ def download_file(path: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _matches_tournament(rnd):
+    name = (rnd.get("tournament") or "").strip()
+    # Check exclusion list first (case-insensitive)
+    name_lower = name.lower()
+    for excl in TOURNAMENT_EXCLUDE:
+        if excl.lower() in name_lower:
+            return False
+    # Then check inclusion filter
     if not TOURNAMENT_FILTER:
         return True
-    t = (rnd.get("tournament") or "").lower()
-    return any(f.lower() in t for f in TOURNAMENT_FILTER)
+    return any(f.lower() in name_lower for f in TOURNAMENT_FILTER)
 
 
 def dedup_rounds(rounds):
@@ -279,30 +354,36 @@ def _is_recent(rnd, cutoff):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOCK EXTRACTION  — the core logic
+#  BLOCK EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Rebuttal speech sections — extract from these
+# Rebuttal speech sections — extract from these (expanded to catch varied styles)
 _REBUTTAL_RE = re.compile(
-    r'^(2AC|2NC|1AR|2AR|1NR|NEG\s*BLOCK|AFF\s*BLOCK|REBUTTAL)',
+    r'^(2AC|2NC|1AR|2AR|1NR|NEG\s*BLOCK|AFF\s*BLOCK|REBUTTAL|'
+    r'ANSWERS?\s+TO|BLOCKS?|OFF\s*CASE|ON\s*CASE)',
     re.IGNORECASE,
 )
 
-# AT: / A2: prefix
+# AT: / A2: prefix detection
 _AT_PREFIX_RE = re.compile(
     r'^(?:AT|A2|ANS(?:WER)?S?\s+TO)\s*[:\-]\s*',
     re.IGNORECASE,
 )
 
-# Junk to strip from argument name tails
+# Trailing junk to strip from argument names
 _TAIL_JUNK_RE = re.compile(
-    r'\s*[-]+\s*(2AC|2NC|1AR|2AR|1NR|Extra|Add\s*[Oo]n|Topshelf).*$',
+    r'\s*[-–—]+\s*(2AC|2NC|1AR|2AR|1NR|Extra|Add\s*[Oo]n|Topshelf).*$',
     re.IGNORECASE,
+)
+
+# Citation tagline: "Lastname YY" or "Smith et al 23" at paragraph start
+# Captures the short cite that debaters read aloud (size 11 bold)
+_CITE_TAG_RE = re.compile(
+    r'^([A-Z][A-Za-z\-]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][A-Za-z\-]+))?\s+\d{2})\b'
 )
 
 
 def _heading_level(para):
-    """Return int 1-6 for Heading styles, None otherwise."""
     name = para.style.name if para.style else ""
     if name.startswith("Heading"):
         try:
@@ -313,81 +394,138 @@ def _heading_level(para):
 
 
 def _xml_escape(text):
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
 
 
-# Map WD_COLOR_INDEX highlight values to hex background colors for PDF
-_HIGHLIGHT_COLORS = {
-    "YELLOW":       "#ffff00",
-    "TURQUOISE":    "#00ffff",
-    "BRIGHT_GREEN": "#00ff00",
-    "PINK":         "#ff69b4",
-    "RED":          "#ff6666",
-    "BLUE":         "#6699ff",
-    "TEAL":         "#00cccc",
-    "VIOLET":       "#cc88ff",
-    "DARK_YELLOW":  "#ffcc00",
-    "GREEN":        "#66cc66",
-}
+def _run_tier(run):
+    """
+    Classify a run: bold+underline → 'read', underline → 'context', else → 'filler'.
+    """
+    bold      = bool(run.bold)
+    underline = bool(run.underline)
+    if bold and underline:
+        return "read"
+    if underline:
+        return "context"
+    return "filler"
+
+
+def _has_highlight(run):
+    h = run.font.highlight_color
+    return h and str(h).split()[0] in _HIGHLIGHT_COLORS
+
+
+def _format_run_fragment(text, bold=False, underline=False, highlight_bg=None, size=None):
+    """Build a ReportLab rich-text span for a fragment of text."""
+    t_esc = _xml_escape(text)
+    if bold and underline:
+        inner = f"<b><u>{t_esc}</u></b>"
+    elif underline:
+        inner = f"<u>{t_esc}</u>"
+    elif bold:
+        inner = f"<b>{t_esc}</b>"
+    else:
+        inner = t_esc
+    if highlight_bg:
+        inner = f'<font backColor="{highlight_bg}">{inner}</font>'
+    fname = FONT_BOLD if bold else FONT_NORMAL
+    return f'<font size="{size}" name="{fname}">{inner}</font>'
 
 
 def _para_to_rich(para):
     """
-    Build ReportLab-safe rich string from paragraph runs.
-    Preserves bold, underline, AND highlight colors so debaters
-    can see exactly which text to read aloud.
+    Convert a paragraph's runs to a ReportLab rich-text string.
+
+    Sizing rules:
+      • Underlined OR highlighted  →  size 11
+      • Everything else            →  size 8
+    Bold/underline markup is preserved on top of sizing.
+    All text uses Calibri.
+
+    Citation tagline detection:
+      If the paragraph text starts with "Lastname YY" (e.g. "Donnelly 23"),
+      that short cite fragment is rendered size 11 bold regardless of run
+      formatting, and the remainder of the citation body stays at size 8.
     """
+    full_text = para.text  # preserve leading spaces for position tracking
+    cite_m = _CITE_TAG_RE.match(full_text.lstrip())
+    # Adjust match position for any leading whitespace
+    leading_ws = len(full_text) - len(full_text.lstrip())
+    cite_end = (leading_ws + cite_m.end(1)) if cite_m else 0
+
     parts = []
+    char_pos = 0  # character position within para.text
+
     for run in para.runs:
         t = run.text
         if not t:
+            char_pos += len(t)
             continue
-        t = _xml_escape(t)
 
-        # Bold / underline
-        if run.bold and run.underline:
-            t = f"<b><u>{t}</u></b>"
-        elif run.bold:
-            t = f"<b>{t}</b>"
-        elif run.underline:
-            t = f"<u>{t}</u>"
+        bold      = bool(run.bold)
+        underline = bool(run.underline)
+        h         = run.font.highlight_color
+        hl_name   = str(h).split()[0] if h else None
+        hl_bg     = _HIGHLIGHT_COLORS.get(hl_name) if hl_name else None
 
-        # Highlight background — wrap outermost
-        h = run.font.highlight_color
-        if h:
-            color_name = str(h).split()[0]  # "TURQUOISE (3)" -> "TURQUOISE"
-            bg = _HIGHLIGHT_COLORS.get(color_name)
-            if bg:
-                t = f'<font backColor="{bg}">{t}</font>'
+        run_start = char_pos
+        run_end   = char_pos + len(t)
 
-        parts.append(t)
+        if cite_end > 0 and run_start < cite_end:
+            # Split the run at the cite boundary
+            split = min(cite_end - run_start, len(t))
+            prefix_text = t[:split]
+            rest_text   = t[split:]
+
+            if prefix_text:
+                # Citation "Lastname YY" → always size 11 bold
+                parts.append(_format_run_fragment(
+                    prefix_text, bold=True, underline=False,
+                    highlight_bg=hl_bg, size=SZ_READ))
+
+            if rest_text:
+                sz = SZ_READ if (underline or hl_bg) else SZ_FILLER
+                parts.append(_format_run_fragment(
+                    rest_text, bold=bold, underline=underline,
+                    highlight_bg=hl_bg, size=sz))
+        else:
+            # Normal run: size 11 if underlined or highlighted, else size 8
+            sz = SZ_READ if (underline or hl_bg) else SZ_FILLER
+            parts.append(_format_run_fragment(
+                t, bold=bold, underline=underline,
+                highlight_bg=hl_bg, size=sz))
+
+        char_pos = run_end
+
     return "".join(parts)
 
 
 def _clean_arg_name(text):
-    """
-    'AT: States'            -> 'States'
-    'AT: Antitrust---2AC'   -> 'Antitrust'
-    Returns None if text doesn't start with AT:/A2:.
-    """
     if not _AT_PREFIX_RE.match(text):
         return None
     name = _AT_PREFIX_RE.sub("", text).strip()
-    name = _TAIL_JUNK_RE.sub("", name).strip().rstrip("-– ").strip()
+    name = _TAIL_JUNK_RE.sub("", name).strip().rstrip("-–— ").strip()
     return name if name else None
 
 
 def extract_blocks(docx_bytes, source_meta):
     """
-    Parse a debate .docx and return rebuttal blocks as list of:
-      { arg_name: str, lines: [rich_str, ...], source: dict }
+    Parse a debate .docx and return rebuttal blocks.
 
-    Structure understood:
-      Heading 1  = speech section (1AC/2AC/etc.)
-      Heading 2  = argument group label (skip if no AT: prefix)
-      Heading 3  = AT: block name        <-- we capture this
-      Heading 4  = card tag line         <-- bold label inside block
-      Normal     = card body text
+    Heading hierarchy:
+      Heading 1  = speech section (1AC / 2AC / 2NC / …)
+      Heading 2  = argument group label  (may or may not start with AT:)
+      Heading 3  = AT: block name        ← captured here
+      Heading 4  = card tag line
+      Normal     = card body text (three-tier formatted)
+
+    Also handles flat structures where AT: appears directly at Heading 2,
+    and files where rebuttal content follows a "Rebuttal" / "Blocks" heading
+    without strict 2AC/2NC labels.
     """
     try:
         doc = Document(io.BytesIO(docx_bytes))
@@ -418,7 +556,7 @@ def extract_blocks(docx_bytes, source_meta):
         if not text:
             continue
 
-        # Heading 1 = speech section boundary
+        # ── Heading 1: speech section boundary ───────────────────────────────
         if level == 1:
             flush()
             in_rebuttal = bool(_REBUTTAL_RE.match(text))
@@ -427,24 +565,24 @@ def extract_blocks(docx_bytes, source_meta):
         if not in_rebuttal:
             continue
 
-        # Heading 2 or 3: check for AT: block header
+        # ── Heading 2 or 3: may be AT: block header ───────────────────────────
         if level in (2, 3):
             arg = _clean_arg_name(text)
             if arg:
                 flush()
                 current_name = arg
-            # else: group label like "States" or "Antitrust" — just skip,
-            #        the AT: heading follows right after at Heading 3
+            # else: group label like "States" — skip silently
             continue
 
-        # Heading 4 inside a block = card tag line
+        # ── Heading 4: card tag line inside a block ───────────────────────────
         if level == 4:
             if current_name:
+                # Tag line: bold, slightly larger, light background
                 safe = _xml_escape(text)
-                current_lines.append(f"<b>{safe}</b>")
+                current_lines.append(f'<font size="10"><b>{safe}</b></font>')
             continue
 
-        # Normal text = card body
+        # ── Normal text: card body with three-tier formatting ─────────────────
         if level is None and current_name:
             rich = _para_to_rich(para)
             if rich.strip():
@@ -463,11 +601,6 @@ def _normalize(name):
 
 
 def group_by_argument(all_blocks):
-    """
-    Collect blocks under canonical argument names.
-    Merges names where one is a substring of the other.
-    Returns dict sorted by block count descending.
-    """
     raw = defaultdict(list)
     for blk in all_blocks:
         raw[blk["arg_name"]].append(blk)
@@ -499,8 +632,8 @@ class BlockfilePDF(BaseDocTemplate):
         super().__init__(
             filename,
             pagesize=letter,
-            leftMargin=0.8*inch, rightMargin=0.8*inch,
-            topMargin=0.75*inch, bottomMargin=0.65*inch,
+            leftMargin=0.75*inch, rightMargin=0.75*inch,
+            topMargin=0.75*inch,  bottomMargin=0.65*inch,
             **kw,
         )
         body = Frame(
@@ -516,7 +649,7 @@ class BlockfilePDF(BaseDocTemplate):
 
     def _footer(self, canvas, doc):
         canvas.saveState()
-        canvas.setFont("Helvetica", 8)
+        canvas.setFont(FONT_NORMAL, 8)
         canvas.setFillColor(C_LIGHT)
         canvas.drawCentredString(
             doc.pagesize[0] / 2, 0.32*inch,
@@ -531,37 +664,43 @@ class BlockfilePDF(BaseDocTemplate):
 
 def _build_styles():
     base = getSampleStyleSheet()
-    S = {}
+    S    = {}
 
     def add(name, parent="Normal", **kw):
         S[name] = ParagraphStyle(name, parent=base[parent], **kw)
 
-    add("CoverTitle", fontSize=34, fontName="Helvetica-Bold",
+    # Cover
+    add("CoverTitle", fontSize=34, fontName=FONT_BOLD,
         textColor=C_BLUE, alignment=TA_CENTER, leading=42, spaceAfter=6)
-    add("CoverSub",   fontSize=18, fontName="Helvetica",
+    add("CoverSub",   fontSize=18, fontName=FONT_NORMAL,
         textColor=C_MUTED, alignment=TA_CENTER, leading=24, spaceAfter=6)
-    add("CoverMeta",  fontSize=11, fontName="Helvetica",
+    add("CoverMeta",  fontSize=11, fontName=FONT_NORMAL,
         textColor=C_MUTED, alignment=TA_CENTER, leading=19, spaceAfter=2)
 
-    add("TOCTitle",   fontSize=20, fontName="Helvetica-Bold",
+    # TOC
+    add("TOCTitle",   fontSize=20, fontName=FONT_BOLD,
         textColor=C_BLUE, spaceAfter=10)
 
-    # Section heading — name must match afterFlowable check above
-    add("ArgHeading", fontSize=14, fontName="Helvetica-Bold",
+    # Section heading (triggers TOC registration)
+    add("ArgHeading", fontSize=14, fontName=FONT_BOLD,
         textColor=white, leading=20, spaceBefore=14, spaceAfter=4,
         backColor=C_BLUE, leftIndent=-4, rightIndent=-4,
         borderPad=(4, 10, 4, 10))
 
-    add("SrcLine",    fontSize=9,  fontName="Helvetica-Bold",
+    # Block source attribution
+    add("SrcLine",    fontSize=9, fontName=FONT_BOLD,
         textColor=C_BLUE, leading=13, spaceBefore=10, spaceAfter=1)
-    add("SrcMeta",    fontSize=8,  fontName="Helvetica",
+    add("SrcMeta",    fontSize=8, fontName=FONT_NORMAL,
         textColor=C_LIGHT, leading=12, spaceAfter=4)
 
-    add("CardTag",    fontSize=9,  fontName="Helvetica-Bold",
-        textColor=C_MUTED, leading=13, spaceBefore=3, spaceAfter=1,
-        backColor=C_TAG_BG, leftIndent=4, borderPad=(2, 4, 2, 4))
+    # Card tag line (Heading 4)
+    add("CardTag",    fontSize=10, fontName=FONT_BOLD,
+        textColor=C_MUTED, leading=14, spaceBefore=5, spaceAfter=1,
+        backColor=C_TAG_BG, leftIndent=6, borderPad=(2, 6, 2, 6))
 
-    add("CardBody",   fontSize=8.5, fontName="Helvetica",
+    # Card body — base style; actual sizes come from inline <font size="N"> tags
+    # Default is filler size (8), with read/context portions inline at size 11
+    add("CardBody",   fontSize=8, fontName=FONT_NORMAL,
         textColor=C_MUTED, leading=13, spaceAfter=1, alignment=TA_JUSTIFY)
 
     return S
@@ -590,7 +729,7 @@ def _cover(story, S, targets, tournaments, n_blocks, n_args, slug):
 def _toc_page(story, S):
     toc = TableOfContents()
     toc.levelStyles = [
-        ParagraphStyle("TOCLevel0", fontSize=10, fontName="Helvetica",
+        ParagraphStyle("TOCLevel0", fontSize=10, fontName=FONT_NORMAL,
                        textColor=C_BLUE, leading=19, leftIndent=0, spaceAfter=2)
     ]
     toc.dotsMinLevel = 0
@@ -634,24 +773,26 @@ def build_pdf(grouped, targets, tournaments, slug, out_path):
             hdr = [Paragraph(l1, S["SrcLine"])]
             if l2:
                 hdr.append(Paragraph(l2, S["SrcMeta"]))
-            hdr.append(HRFlowable(width="100%", color=C_RULE,
-                                  thickness=0.5, spaceAfter=3))
+            hdr.append(HRFlowable(width="100%", color=C_RULE, thickness=0.5, spaceAfter=3))
 
             body = []
             for line in blk["lines"]:
-                is_tag = (line.startswith("<b>") and line.endswith("</b>")
-                          and len(line) < 500)
-                style  = S["CardTag"] if is_tag else S["CardBody"]
+                # Detect card tag lines (wrapped in bold font tag by extractor)
+                is_tag = (line.startswith('<font size="10"><b>') and
+                          line.endswith('</b></font>') and
+                          len(line) < 600)
+                style = S["CardTag"] if is_tag else S["CardBody"]
                 try:
                     body.append(Paragraph(line, style))
                 except Exception:
+                    # Strip all tags as fallback
                     plain = re.sub(r'<[^>]+>', '', line)
                     if plain.strip():
-                        body.append(Paragraph(_xml_escape(plain), style))
+                        body.append(Paragraph(_xml_escape(plain), S["CardBody"]))
 
             body.append(Spacer(1, 0.10*inch))
 
-            # Keep attribution + first few lines together
+            # Keep attribution + first few card lines together on same page
             story.append(KeepTogether(hdr + body[:5]))
             for e in body[5:]:
                 story.append(e)
@@ -673,7 +814,10 @@ def main():
 
     print()
     print("="*62)
-    print(f"  Tournament filter: {' | '.join(TOURNAMENT_FILTER) if TOURNAMENT_FILTER else 'none (all)'}")
+    incl = ' | '.join(TOURNAMENT_FILTER) if TOURNAMENT_FILTER else 'all'
+    excl = ' | '.join(TOURNAMENT_EXCLUDE) if TOURNAMENT_EXCLUDE else 'none'
+    print(f"  Include tournaments : {incl}")
+    print(f"  Exclude tournaments : {excl}")
     print("="*62 + "\n")
 
     print("Resolving targets...")
@@ -731,8 +875,7 @@ def main():
 
     if not all_blocks:
         print("\n[!] No blocks found.")
-        print("    The files may not have 2AC/2NC sections with AT: headings,")
-        print("    or the tournament filter excluded everything.")
+        print("    The files may not have 2AC/2NC sections with AT: headings.")
         return
 
     print("\nGrouping by argument...")
