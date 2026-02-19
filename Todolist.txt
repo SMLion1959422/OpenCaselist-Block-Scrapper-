@@ -1,0 +1,7 @@
+Ok after the final iteration of the project we have a working scraper but there are several issues that need to be done:
+1) Weird formatting issues, there isn't a consistent cut of cards which means that we need to go back and ensure all cards are cut the way we would
+2) Find a way for the system to be able to download PDF files rather than only accepting Docx files
+3) Create a proper topic selection menu where all tournaments from Tabroom are loaded onto the program so that a user can say feb as a topic and it will look thorugh all feburary tournaments on a specific team
+4) - this is a bit ambitious but we need to get a full school scrape working
+5) Create a front end website so that this is easy for people to use
+6) lock in
