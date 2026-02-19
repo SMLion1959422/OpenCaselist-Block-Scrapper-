@@ -706,10 +706,13 @@ def _build_styles():
     return S
 
 
-def _cover(story, S, targets, tournaments, n_blocks, n_args, slug):
+def _cover(story, S, targets, tournaments, n_blocks, n_args, slug, blockfile_type=""):
     story.append(Spacer(1, 1.2*inch))
     story.append(Paragraph("PF Evidence Blockfile", S["CoverTitle"]))
-    story.append(Paragraph(_xml_escape(slug), S["CoverSub"]))
+    sub = f"{_xml_escape(slug)}"
+    if blockfile_type:
+        sub += f"  ·  {_xml_escape(blockfile_type)}"
+    story.append(Paragraph(sub, S["CoverSub"]))
     story.append(Spacer(1, 0.2*inch))
     story.append(HRFlowable(width="55%", color=C_RULE, spaceAfter=14))
     for label, val in [
@@ -754,17 +757,19 @@ def _fmt_source(src):
     return line1, "   |   ".join(parts)
 
 
-def build_pdf(grouped, targets, tournaments, slug, out_path):
+def build_pdf(grouped, targets, tournaments, slug, out_path, blockfile_type=""):
     S        = _build_styles()
     n_blocks = sum(len(v) for v in grouped.values())
     n_args   = len(grouped)
     story    = []
 
-    _cover(story, S, targets, tournaments, n_blocks, n_args, slug)
+    _cover(story, S, targets, tournaments, n_blocks, n_args, slug, blockfile_type)
     _toc_page(story, S)
 
+    prefix = f"{blockfile_type}:" if blockfile_type else "AT:"
+
     for arg_name, blocks in grouped.items():
-        label = f"AT:  {arg_name}   ({len(blocks)} block{'s' if len(blocks)!=1 else ''})"
+        label = f"{prefix}  {arg_name}   ({len(blocks)} block{'s' if len(blocks)!=1 else ''})"
         story.append(Paragraph(label, S["ArgHeading"]))
         story.append(HRFlowable(width="100%", color=C_RULE, thickness=0.5, spaceAfter=2))
 
@@ -859,7 +864,9 @@ def main():
 
     for i, meta in enumerate(all_metas, 1):
         tourn = meta["tournament"].lstrip("0123456789-– ").strip() or "Unknown"
-        print(f"  [{i:3d}/{len(all_metas)}]  {meta['school']}/{meta['team']}  ·  {tourn}")
+        side  = meta.get("side", "").upper()
+        side_label = "AFF" if side == "A" else ("NEG" if side == "N" else "???")
+        print(f"  [{i:3d}/{len(all_metas)}]  {meta['school']}/{meta['team']}  ·  {side_label}  ·  {tourn}")
         data = download_file(meta["opensource"])
         if not data:
             failed += 1
@@ -878,13 +885,27 @@ def main():
         print("    The files may not have 2AC/2NC sections with AT: headings.")
         return
 
-    print("\nGrouping by argument...")
-    grouped = group_by_argument(all_blocks)
-    print(f"  {len(grouped)} unique argument(s)\n")
-    for arg, blks in list(grouped.items())[:20]:
-        print(f"    AT: {arg:<45s}  {len(blks)} block(s)")
-    if len(grouped) > 20:
-        print(f"    ... and {len(grouped)-20} more")
+    # ── Split blocks by round side ────────────────────────────────────────────
+    # Team ran AFF  → their blocks answer NEG arguments  → AT: NEG blockfile
+    # Team ran NEG  → their blocks answer AFF arguments  → AT: AFF blockfile
+    # Unknown side  → included in both as a fallback
+    aff_blocks  = []   # AT: NEG (team was AFF)
+    neg_blocks  = []   # AT: AFF (team was NEG)
+    unk_blocks  = []   # side unknown
+
+    for blk in all_blocks:
+        side = blk["source"].get("side", "").upper()
+        if side == "A":
+            aff_blocks.append(blk)
+        elif side == "N":
+            neg_blocks.append(blk)
+        else:
+            unk_blocks.append(blk)
+
+    if unk_blocks:
+        print(f"\n  [!] {len(unk_blocks)} block(s) had no side data — included in both PDFs.")
+        aff_blocks.extend(unk_blocks)
+        neg_blocks.extend(unk_blocks)
 
     if mode == "teams":
         targets = ", ".join(f"{s}/{t}" for s, t in spec)
@@ -893,16 +914,48 @@ def main():
     else:
         targets = f"recent ({spec} days)"
 
-    out_path = OUTPUT_DIR / f"blockfile_{slug}.pdf"
-    print(f"\nBuilding PDF -> {out_path.name}")
-    build_pdf(grouped, targets, tournaments_seen, slug, out_path)
+    outputs = []
 
+    # ── AT: NEG blockfile (from AFF rounds) ──────────────────────────────────
+    if aff_blocks:
+        print(f"\nGrouping AT: NEG blocks ({len(aff_blocks)} blocks from AFF rounds)...")
+        grouped_neg = group_by_argument(aff_blocks)
+        print(f"  {len(grouped_neg)} unique argument(s)")
+        for arg, blks in list(grouped_neg.items())[:20]:
+            print(f"    AT: NEG  {arg:<40s}  {len(blks)} block(s)")
+        if len(grouped_neg) > 20:
+            print(f"    ... and {len(grouped_neg)-20} more")
+        out_neg = OUTPUT_DIR / f"blockfile_{slug}_AT_NEG.pdf"
+        print(f"\nBuilding AT: NEG PDF -> {out_neg.name}")
+        build_pdf(grouped_neg, targets, tournaments_seen, slug, out_neg,
+                  blockfile_type="AT: NEG")
+        outputs.append(("AT: NEG", out_neg, len(grouped_neg), len(aff_blocks)))
+    else:
+        print("\n  [!] No AFF-side rounds found — AT: NEG blockfile skipped.")
+
+    # ── AT: AFF blockfile (from NEG rounds) ──────────────────────────────────
+    if neg_blocks:
+        print(f"\nGrouping AT: AFF blocks ({len(neg_blocks)} blocks from NEG rounds)...")
+        grouped_aff = group_by_argument(neg_blocks)
+        print(f"  {len(grouped_aff)} unique argument(s)")
+        for arg, blks in list(grouped_aff.items())[:20]:
+            print(f"    AT: AFF  {arg:<40s}  {len(blks)} block(s)")
+        if len(grouped_aff) > 20:
+            print(f"    ... and {len(grouped_aff)-20} more")
+        out_aff = OUTPUT_DIR / f"blockfile_{slug}_AT_AFF.pdf"
+        print(f"\nBuilding AT: AFF PDF -> {out_aff.name}")
+        build_pdf(grouped_aff, targets, tournaments_seen, slug, out_aff,
+                  blockfile_type="AT: AFF")
+        outputs.append(("AT: AFF", out_aff, len(grouped_aff), len(neg_blocks)))
+    else:
+        print("\n  [!] No NEG-side rounds found — AT: AFF blockfile skipped.")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
     print()
     print("="*62)
     print(f"  DONE!")
-    print(f"  Arguments : {len(grouped)}")
-    print(f"  Blocks    : {len(all_blocks)}")
-    print(f"  Output    : {out_path.resolve()}")
+    for btype, path, n_args, n_blks in outputs:
+        print(f"  {btype:<10s}  {n_args} args  {n_blks} blocks  →  {path.name}")
     print("="*62 + "\n")
 
 
