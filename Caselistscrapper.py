@@ -1,218 +1,175 @@
 """
-OpenCaselist Scraper v2 (Interactive Target Mode)
-=================================================
-Downloads open-source round files and compiles them into a PDF,
-preserving the ORIGINAL formatting from the source documents.
+caselist_unified.py  –  PF Evidence Block Compiler
+====================================================
+Downloads open-source round files from OpenCaselist, filters to prestige
+tournaments, extracts 2AC/2NC rebuttal blocks, and compiles them into a
+clean PDF organized by argument — matching the Ultimate Prep Blockfile format.
 
-QUICK START:
-  1. pip install requests python-docx docx2pdf
-  2. Put your CASELIST_TOKEN below (DO NOT SHARE IT)
-  3. Run: python caselist_scraper.py
-  4. Choose a TARGET_MODE when prompted
+HOW IT WORKS:
+  Each debate .docx has this structure:
+    Heading 1  →  1AC  (constructive — SKIP)
+    Heading 1  →  2AC  (rebuttal — EXTRACT from here)
+      Heading 2  →  States          (argument group label)
+      Heading 3  →  AT: States      (block name  ← captured here)
+      Heading 4  →  1. Aff solves…  (card tag line)
+      Normal     →  Donnelly 23…    (card text)
+      Heading 3  →  AT: Antitrust   (next block)
+      ...
 
-TARGET_MODE options:
-  "teams"   - specific list of (school, team) pairs you name
-  "school"  - every team inside one or more schools
-  "recent"  - rounds uploaded in the last N days (across whole caselist)
-  "topic"   - scan all teams, include only rounds matching topic keywords
+  We skip 1AC/1NC entirely and only extract from 2AC/2NC/1AR/2AR/1NR.
+  All blocks with the same argument name are merged across every file/round.
 
-TOPIC FILTERING:
-  Set TOPIC_KEYWORDS to words/phrases that appear in round reports.
-  A round is included if its report contains ANY keyword.
-  Set to [] to include everything.
+REQUIREMENTS:
+    pip install requests python-docx pypdf reportlab
 
-PDF CONVERSION:
-  On Windows with Microsoft Word: uses docx2pdf (best quality).
-  Without Word: install LibreOffice and it auto-detects it,
-  OR open the saved .docx in Word and Save As PDF manually.
+USAGE:
+    python caselist_unified.py
 """
 
-import requests
-import hashlib
-import time
-import io
-import os
-import copy
-import json
-import subprocess
-from pathlib import Path
-from datetime import datetime, timedelta
+import hashlib, io, json, re, time
 from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
 
+import requests
 from docx import Document
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-from docx.shared import Pt, RGBColor, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-# ═══════════════════════════════════════════════════════════════
-#  CONFIGURATION — EDIT THIS SECTION
-# ═══════════════════════════════════════════════════════════════
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib.colors import HexColor, white
+from reportlab.platypus import (
+    BaseDocTemplate, Frame, PageTemplate,
+    Paragraph, Spacer, PageBreak, HRFlowable,
+    KeepTogether,
+)
+from reportlab.platypus.tableofcontents import TableOfContents
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 
-# DO NOT SHARE THIS TOKEN PUBLICLY.
-CASELIST_TOKEN = "REPLACE_ME_WITH_YOUR_TOKEN"   # from browser cookies
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CASELIST_TOKEN = "375582f6bb7183c0cb5e6a8ce306a8c1"
 CASELIST       = "hspf25"
 
-# Defaults (used if you choose to keep them / fallbacks)
-SPECIFIC_TEAMS = [
-    ("StrakeJesuitCollegePreparatory", "CaMa"),
-    # ("Lexington", "MS"),
-    # ("Westwood", "AG"),
-]
+# Only keep rounds from tournaments whose name contains one of these strings.
+# Set to [] to keep all tournaments.
+TOURNAMENT_FILTER = ["Harvard", "Berkeley", "Stanford", "Bellaire", "Pennsbury"]
 
-SPECIFIC_SCHOOLS = [
-    "StrakeJesuitCollegePreparatory",
-    # "Lexington",
-]
+OUTPUT_DIR = Path("caselist_output")
+CACHE_DIR  = OUTPUT_DIR / "cache"
 
-DAYS_RECENT = 7
+# ── Colors ───────────────────────────────────────────────────────────────────
+C_BLUE     = HexColor("#1a5fa8")
+C_MUTED    = HexColor("#444444")
+C_LIGHT    = HexColor("#777777")
+C_RULE     = HexColor("#b8cce4")
+C_TAG_BG   = HexColor("#f0f5fc")
 
-# Topic keyword filter — applies on top of any mode above.
-TOPIC_KEYWORDS = []
-
-# Output settings
-OUTPUT_DIR  = Path("caselist_output")
-CACHE_DIR   = OUTPUT_DIR / "cache"
-OUTPUT_NAME = "compiled_blocks"
-
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 
 API_BASE = "https://api.opencaselist.com/v1"
-
-session = requests.Session()
+session  = requests.Session()
 session.cookies.set("caselist_token", CASELIST_TOKEN, domain=".opencaselist.com")
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://opencaselist.com/",
+    "Referer":    "https://opencaselist.com/",
 })
 
 
-# ───────────────────────────────────────────────────────────────
-#  INTERACTIVE TARGET MODE PROMPT
-# ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE PROMPTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def prompt_for_target_mode():
-    print("\nSelect target mode:")
-    print("  1. teams   - specific (school, team) pairs")
-    print("  2. school  - all teams inside one or more schools")
-    print("  3. recent  - rounds uploaded in last N days (site-wide scan)")
-    print("  4. topic   - scan all teams matching topic keywords (site-wide scan)")
-    print("  (Press Enter for default: teams)\n")
+def prompt_targets():
+    print("\n" + "="*62)
+    print("   PF Evidence Block Compiler")
+    print("="*62)
+    print()
+    print("Select target mode:")
+    print("  1. Specific team(s)   [recommended — fast]")
+    print("  2. All teams in a school")
+    print("  3. Recent rounds  (last N days, site-wide — slow)")
+    print()
 
-    choice = input("Enter choice (1-4): ").strip()
-
-    if choice == "" or choice == "1":
-        mode = "teams"
-        teams = []
-        print("\nEnter teams as: School,Team  (blank line to finish)")
-        print("Example: StrakeJesuitCollegePreparatory,CaMa\n")
-        while True:
-            line = input("Team: ").strip()
-            if not line:
-                break
-            try:
-                school, team = [x.strip() for x in line.split(",", 1)]
-                if school and team:
-                    teams.append((school, team))
-                else:
-                    print("  Must include both school and team.")
-            except Exception:
-                print("  Format must be: School,Team")
-
-        # fallback to config defaults if user entered nothing
-        if not teams:
-            teams = SPECIFIC_TEAMS
-
-        return mode, {"SPECIFIC_TEAMS": teams}
+    choice = input("Choice [1]: ").strip() or "1"
 
     if choice == "2":
-        mode = "school"
         schools = []
-        print("\nEnter school names (blank line to finish)")
+        print("\nEnter school names — blank line to finish:")
         print("Example: StrakeJesuitCollegePreparatory\n")
         while True:
-            line = input("School: ").strip()
-            if not line:
+            s = input("School: ").strip()
+            if not s:
                 break
-            schools.append(line)
-
+            schools.append(s)
         if not schools:
-            schools = SPECIFIC_SCHOOLS
-
-        return mode, {"SPECIFIC_SCHOOLS": schools}
+            schools = ["StrakeJesuitCollegePreparatory"]
+        return "school", schools
 
     if choice == "3":
-        mode = "recent"
-        days = input("How many days back? (default 7): ").strip()
+        raw = input("How many days back? [7]: ").strip()
         try:
-            days_int = int(days) if days else DAYS_RECENT
-        except Exception:
-            days_int = DAYS_RECENT
-        return mode, {"DAYS_RECENT": days_int}
+            days = int(raw) if raw else 7
+        except ValueError:
+            days = 7
+        return "recent", days
 
-    if choice == "4":
-        mode = "topic"
-        print("\nEnter topic keywords separated by commas.")
-        print('Example: antitrust, FTC, data, AI, tech, court\n')
-        keywords = input("Keywords: ").strip()
-        kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
-        return mode, {"TOPIC_KEYWORDS": kw_list}
-
-    print("Invalid choice. Defaulting to teams.")
-    return "teams", {"SPECIFIC_TEAMS": SPECIFIC_TEAMS}
-
-
-def prompt_optional_topic_filter():
-    """
-    Optional topic filter that can apply on top of any mode (including teams/school/recent).
-    If the user leaves blank, keep current TOPIC_KEYWORDS (usually []).
-    """
-    print("\nOptional: apply a topic filter on top of your mode?")
-    print("- Leave blank for NO filter (include all rounds).")
-    print("- Or enter keywords separated by commas.")
-    print('  Example: K, framework, ontology\n')
-    resp = input("Topic keywords (blank = none): ").strip()
-    if not resp:
-        return None
-    kw_list = [k.strip() for k in resp.split(",") if k.strip()]
-    return kw_list
+    teams = []
+    print("\nEnter teams as  School,Team  — blank line to finish:")
+    print("Example: StrakeJesuitCollegePreparatory,CaMa\n")
+    while True:
+        line = input("Team: ").strip()
+        if not line:
+            break
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) == 2 and all(parts):
+            teams.append(tuple(parts))
+        else:
+            print("  Format must be  School,Team")
+    if not teams:
+        print("  (Using default: StrakeJesuitCollegePreparatory / CaMa)")
+        teams = [("StrakeJesuitCollegePreparatory", "CaMa")]
+    return "teams", teams
 
 
-# ───────────────────────────────────────────────────────────────
-#  API HELPERS
-# ───────────────────────────────────────────────────────────────
+def prompt_slug():
+    raw = input("\nOutput filename slug (e.g. CaMa): ").strip()
+    return re.sub(r'\W+', '_', raw) if raw else "blockfile"
 
-def api_get(url, params=None, retries=3):
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  API + DOWNLOAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def api_get(url, retries=3):
     for attempt in range(retries):
         try:
-            r = session.get(url, params=params, timeout=15)
+            r = session.get(url, timeout=15)
             if r.status_code == 429:
-                wait = 10 * (attempt + 1)
-                print(f"  [rate limit] waiting {wait}s...")
-                time.sleep(wait)
+                time.sleep(10 * (attempt + 1))
                 continue
             if r.status_code == 404:
                 return None
             r.raise_for_status()
             return r.json()
         except Exception:
-            if attempt == retries - 1:
-                return None
-            time.sleep(2 ** attempt)
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
     return None
 
 
 def fetch_all_schools():
-    print(f"[→] Fetching schools in {CASELIST}...")
     data = api_get(f"{API_BASE}/caselists/{CASELIST}/schools")
     if not data:
         return []
-    schools = data if isinstance(data, list) else data.get("schools", [])
-    print(f"    {len(schools)} schools found")
-    return schools
+    return data if isinstance(data, list) else data.get("schools", [])
 
 
 def fetch_teams_in_school(school):
@@ -223,92 +180,93 @@ def fetch_teams_in_school(school):
 
 
 def fetch_rounds(school, team):
-    cache_key = hashlib.md5(f"{CASELIST}{school}{team}".encode()).hexdigest()
-    cache_file = CACHE_DIR / f"rounds_{cache_key}.json"
-    if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 3600:
-        return json.loads(cache_file.read_text())
-
-    # Try two URL patterns
+    key  = hashlib.md5(f"{CASELIST}{school}{team}".encode()).hexdigest()
+    path = CACHE_DIR / f"rounds_{key}.json"
+    if path.exists() and (time.time() - path.stat().st_mtime) < 3600:
+        return json.loads(path.read_text())
     data = api_get(f"{API_BASE}/caselists/{CASELIST}/schools/{school}/teams/{team}/rounds")
     if data is None:
         data = api_get(f"{API_BASE}/caselists/{CASELIST}/teams/{school}/{team}/rounds")
     if not data:
         return []
-
     rounds = data if isinstance(data, list) else data.get("rounds", [])
-    cache_file.write_text(json.dumps(rounds))
+    path.write_text(json.dumps(rounds))
     time.sleep(0.3)
     return rounds
 
 
-# ───────────────────────────────────────────────────────────────
+def download_file(path: str):
+    key    = hashlib.md5(path.encode()).hexdigest()
+    cached = CACHE_DIR / f"{key}.docx"
+    if cached.exists():
+        return cached.read_bytes()
+    print(f"    [down] {Path(path).name}")
+    for attempt in range(3):
+        try:
+            r = session.get(f"{API_BASE}/download", params={"path": path}, timeout=30)
+            if r.status_code == 200 and r.content[:4] == b'PK\x03\x04':
+                cached.write_bytes(r.content)
+                time.sleep(0.6)
+                return r.content
+            time.sleep(2 ** attempt)
+        except Exception:
+            time.sleep(2 ** attempt)
+    print(f"    [FAIL] {Path(path).name}")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  TARGET RESOLUTION
-# ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# runtime-selected
-TARGET_MODE = "teams"  # will be overwritten by prompt
+def _matches_tournament(rnd):
+    if not TOURNAMENT_FILTER:
+        return True
+    t = (rnd.get("tournament") or "").lower()
+    return any(f.lower() in t for f in TOURNAMENT_FILTER)
 
 
-def resolve_targets():
-    """Returns list of (school, team, rounds)."""
+def dedup_rounds(rounds):
+    seen = {}
+    for r in rounds:
+        path = r.get("opensource")
+        if path and path not in seen and _matches_tournament(r):
+            seen[path] = r
+    return list(seen.values())
+
+
+def resolve_targets(mode, spec):
     results = []
+    if mode == "teams":
+        for school, team in spec:
+            print(f"  [->] {school} / {team}")
+            results.append((school, team, fetch_rounds(school, team)))
 
-    if TARGET_MODE == "teams":
-        for (school, team) in SPECIFIC_TEAMS:
-            print(f"[→] {school} / {team}")
-            rounds = fetch_rounds(school, team)
-            results.append((school, team, rounds))
+    elif mode == "school":
+        for school in spec:
+            print(f"  [->] School: {school}")
+            for obj in fetch_teams_in_school(school):
+                team = obj if isinstance(obj, str) else obj.get("team", "")
+                if team:
+                    results.append((school, team, fetch_rounds(school, team)))
+                    time.sleep(0.2)
 
-    elif TARGET_MODE == "school":
-        for school in SPECIFIC_SCHOOLS:
-            print(f"[→] School: {school}")
-            teams = fetch_teams_in_school(school)
-            for team_obj in teams:
-                team = team_obj if isinstance(team_obj, str) else team_obj.get("team", "")
-                if not team:
-                    continue
-                rounds = fetch_rounds(school, team)
-                results.append((school, team, rounds))
-                time.sleep(0.2)
-
-    elif TARGET_MODE == "recent":
-        cutoff = datetime.utcnow() - timedelta(days=DAYS_RECENT)
-        print(f"[→] Rounds uploaded since {cutoff.strftime('%Y-%m-%d')} ({DAYS_RECENT} days)...")
-        schools = fetch_all_schools()
-        for school_obj in schools:
+    elif mode == "recent":
+        days   = spec
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        print(f"  [->] Rounds since {cutoff.strftime('%Y-%m-%d')}")
+        for school_obj in fetch_all_schools():
             school = school_obj if isinstance(school_obj, str) else school_obj.get("name", "")
             if not school:
                 continue
-            for team_obj in fetch_teams_in_school(school):
-                team = team_obj if isinstance(team_obj, str) else team_obj.get("team", "")
+            for obj in fetch_teams_in_school(school):
+                team = obj if isinstance(obj, str) else obj.get("team", "")
                 if not team:
                     continue
-                rounds = fetch_rounds(school, team)
-                recent = [r for r in rounds if _is_recent(r, cutoff)]
-                if recent:
-                    results.append((school, team, recent))
+                rounds = [r for r in fetch_rounds(school, team) if _is_recent(r, cutoff)]
+                if rounds:
+                    results.append((school, team, rounds))
             time.sleep(0.2)
-
-    elif TARGET_MODE == "topic":
-        if not TOPIC_KEYWORDS:
-            print("[!] topic mode requires TOPIC_KEYWORDS to be set!")
-            return []
-        print(f"[→] Topic scan: {TOPIC_KEYWORDS}")
-        schools = fetch_all_schools()
-        for school_obj in schools:
-            school = school_obj if isinstance(school_obj, str) else school_obj.get("name", "")
-            if not school:
-                continue
-            for team_obj in fetch_teams_in_school(school):
-                team = team_obj if isinstance(team_obj, str) else team_obj.get("team", "")
-                if not team:
-                    continue
-                rounds = fetch_rounds(school, team)
-                matching = [r for r in rounds if _matches_topic(r)]
-                if matching:
-                    results.append((school, team, matching))
-            time.sleep(0.2)
-
     return results
 
 
@@ -320,326 +278,489 @@ def _is_recent(rnd, cutoff):
         return False
 
 
-def _matches_topic(rnd):
-    if not TOPIC_KEYWORDS:
-        return True
-    text = ((rnd.get("report") or "") + " " + (rnd.get("opensource") or "")).lower()
-    return any(kw.lower() in text for kw in TOPIC_KEYWORDS)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BLOCK EXTRACTION  — the core logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Rebuttal speech sections — extract from these
+_REBUTTAL_RE = re.compile(
+    r'^(2AC|2NC|1AR|2AR|1NR|NEG\s*BLOCK|AFF\s*BLOCK|REBUTTAL)',
+    re.IGNORECASE,
+)
+
+# AT: / A2: prefix
+_AT_PREFIX_RE = re.compile(
+    r'^(?:AT|A2|ANS(?:WER)?S?\s+TO)\s*[:\-]\s*',
+    re.IGNORECASE,
+)
+
+# Junk to strip from argument name tails
+_TAIL_JUNK_RE = re.compile(
+    r'\s*[-]+\s*(2AC|2NC|1AR|2AR|1NR|Extra|Add\s*[Oo]n|Topshelf).*$',
+    re.IGNORECASE,
+)
 
 
-def dedup_rounds(rounds):
-    """One entry per unique file path, topic-filtered."""
-    seen = {}
-    for r in rounds:
-        path = r.get("opensource")
-        if path and path not in seen and _matches_topic(r):
-            seen[path] = r
-    return list(seen.values())
-
-
-# ───────────────────────────────────────────────────────────────
-#  FILE DOWNLOAD
-# ───────────────────────────────────────────────────────────────
-
-def download_file(path: str):
-    key = hashlib.md5(path.encode()).hexdigest()
-    cached = CACHE_DIR / f"{key}.docx"
-    if cached.exists():
-        return cached.read_bytes()
-
-    print(f"    [↓] {Path(path).name}")
-    for attempt in range(3):
+def _heading_level(para):
+    """Return int 1-6 for Heading styles, None otherwise."""
+    name = para.style.name if para.style else ""
+    if name.startswith("Heading"):
         try:
-            r = session.get(f"{API_BASE}/download", params={"path": path}, timeout=30)
-            if r.status_code == 200 and r.content[:4] == b'PK\x03\x04':
-                cached.write_bytes(r.content)
-                time.sleep(0.6)
-                return r.content
-            else:
-                time.sleep(2 ** attempt)
-        except Exception:
-            time.sleep(2 ** attempt)
-    print(f"    [!] Failed after 3 attempts: {Path(path).name}")
+            return int(name.split()[-1])
+        except ValueError:
+            return 1
     return None
 
 
-# ───────────────────────────────────────────────────────────────
-#  FORMAT-PRESERVING DOCX MERGE
-# ───────────────────────────────────────────────────────────────
-
-def _add_attr_paragraph(doc, text, hex_color, bold=False, size_pt=10,
-                        space_before_pt=0, space_after_pt=3):
-    para = doc.add_paragraph()
-    para.paragraph_format.space_before = Pt(space_before_pt)
-    para.paragraph_format.space_after  = Pt(space_after_pt)
-    run = para.add_run(text)
-    run.bold = bold
-    run.font.size = Pt(size_pt)
-    r = int(hex_color[0:2], 16)
-    g = int(hex_color[2:4], 16)
-    b = int(hex_color[4:6], 16)
-    run.font.color.rgb = RGBColor(r, g, b)
-    return para
+def _xml_escape(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _add_rule(doc, color="3366AA"):
-    para = doc.add_paragraph()
-    para.paragraph_format.space_before = Pt(1)
-    para.paragraph_format.space_after  = Pt(1)
-    pPr  = para._p.get_or_add_pPr()
-    pBdr = OxmlElement("w:pBdr")
-    bot  = OxmlElement("w:bottom")
-    bot.set(qn("w:val"),   "single")
-    bot.set(qn("w:sz"),    "6")
-    bot.set(qn("w:space"), "1")
-    bot.set(qn("w:color"), color)
-    pBdr.append(bot)
-    pPr.append(pBdr)
+# Map WD_COLOR_INDEX highlight values to hex background colors for PDF
+_HIGHLIGHT_COLORS = {
+    "YELLOW":       "#ffff00",
+    "TURQUOISE":    "#00ffff",
+    "BRIGHT_GREEN": "#00ff00",
+    "PINK":         "#ff69b4",
+    "RED":          "#ff6666",
+    "BLUE":         "#6699ff",
+    "TEAL":         "#00cccc",
+    "VIOLET":       "#cc88ff",
+    "DARK_YELLOW":  "#ffcc00",
+    "GREEN":        "#66cc66",
+}
 
 
-def copy_docx_into(src_bytes: bytes, dest_doc: Document, meta: dict) -> int:
+def _para_to_rich(para):
     """
-    Inserts attribution header then copies every paragraph from src_bytes
-    into dest_doc using raw XML copy for full format preservation.
+    Build ReportLab-safe rich string from paragraph runs.
+    Preserves bold, underline, AND highlight colors so debaters
+    can see exactly which text to read aloud.
+    """
+    parts = []
+    for run in para.runs:
+        t = run.text
+        if not t:
+            continue
+        t = _xml_escape(t)
+
+        # Bold / underline
+        if run.bold and run.underline:
+            t = f"<b><u>{t}</u></b>"
+        elif run.bold:
+            t = f"<b>{t}</b>"
+        elif run.underline:
+            t = f"<u>{t}</u>"
+
+        # Highlight background — wrap outermost
+        h = run.font.highlight_color
+        if h:
+            color_name = str(h).split()[0]  # "TURQUOISE (3)" -> "TURQUOISE"
+            bg = _HIGHLIGHT_COLORS.get(color_name)
+            if bg:
+                t = f'<font backColor="{bg}">{t}</font>'
+
+        parts.append(t)
+    return "".join(parts)
+
+
+def _clean_arg_name(text):
+    """
+    'AT: States'            -> 'States'
+    'AT: Antitrust---2AC'   -> 'Antitrust'
+    Returns None if text doesn't start with AT:/A2:.
+    """
+    if not _AT_PREFIX_RE.match(text):
+        return None
+    name = _AT_PREFIX_RE.sub("", text).strip()
+    name = _TAIL_JUNK_RE.sub("", name).strip().rstrip("-– ").strip()
+    return name if name else None
+
+
+def extract_blocks(docx_bytes, source_meta):
+    """
+    Parse a debate .docx and return rebuttal blocks as list of:
+      { arg_name: str, lines: [rich_str, ...], source: dict }
+
+    Structure understood:
+      Heading 1  = speech section (1AC/2AC/etc.)
+      Heading 2  = argument group label (skip if no AT: prefix)
+      Heading 3  = AT: block name        <-- we capture this
+      Heading 4  = card tag line         <-- bold label inside block
+      Normal     = card body text
     """
     try:
-        src = Document(io.BytesIO(src_bytes))
+        doc = Document(io.BytesIO(docx_bytes))
     except Exception as e:
         print(f"    [!] Parse error: {e}")
-        return 0
+        return []
 
-    side  = "AFF" if meta.get("side") == "A" else "NEG"
-    tourn = meta.get("tournament", "").lstrip("0123456789-– ").strip()
-    rnd   = meta.get("round", "")
-    opp   = meta.get("opponent", "")
-    judge = meta.get("judge", "")
-    fname = Path(meta.get("opensource", "")).name
+    blocks        = []
+    in_rebuttal   = False
+    current_name  = None
+    current_lines = []
 
-    # Attribution block
-    _add_attr_paragraph(dest_doc, "─" * 72, "2255AA",
-                        size_pt=7, space_before_pt=12, space_after_pt=1)
-    _add_attr_paragraph(dest_doc,
-        f"{meta.get('school','')}  /  {meta.get('team','')}   ·   "
-        f"{side}   ·   {tourn}  —  Round {rnd}",
-        "1a5fa8", bold=True, size_pt=11, space_before_pt=1, space_after_pt=1)
-    if opp:
-        _add_attr_paragraph(dest_doc,
-            f"vs {opp}   |   Judge: {judge}",
-            "777777", size_pt=9, space_after_pt=1)
-    report = meta.get("report", "")
-    if report:
-        _add_attr_paragraph(dest_doc,
-            report.replace("\n", "  |  "),
-            "999999", size_pt=8, space_after_pt=1)
-    _add_attr_paragraph(dest_doc, f"File: {fname}",
-                        "AAAAAA", size_pt=7, space_after_pt=3)
-    _add_rule(dest_doc)
+    def flush():
+        nonlocal current_name, current_lines
+        if current_name and current_lines:
+            blocks.append({
+                "arg_name": current_name,
+                "lines":    current_lines[:],
+                "source":   source_meta,
+            })
+        current_name  = None
+        current_lines = []
 
-    # Copy raw XML paragraphs
-    dest_body = dest_doc.element.body
-    insert_idx = len(dest_body) - 1  # before sectPr
-    count = 0
-    for para in src.paragraphs:
-        new_p = copy.deepcopy(para._element)
-        dest_body.insert(insert_idx, new_p)
-        insert_idx += 1
-        count += 1
+    for para in doc.paragraphs:
+        text  = para.text.strip()
+        level = _heading_level(para)
 
-    dest_doc.add_paragraph()  # spacing between files
-    return count
+        if not text:
+            continue
+
+        # Heading 1 = speech section boundary
+        if level == 1:
+            flush()
+            in_rebuttal = bool(_REBUTTAL_RE.match(text))
+            continue
+
+        if not in_rebuttal:
+            continue
+
+        # Heading 2 or 3: check for AT: block header
+        if level in (2, 3):
+            arg = _clean_arg_name(text)
+            if arg:
+                flush()
+                current_name = arg
+            # else: group label like "States" or "Antitrust" — just skip,
+            #        the AT: heading follows right after at Heading 3
+            continue
+
+        # Heading 4 inside a block = card tag line
+        if level == 4:
+            if current_name:
+                safe = _xml_escape(text)
+                current_lines.append(f"<b>{safe}</b>")
+            continue
+
+        # Normal text = card body
+        if level is None and current_name:
+            rich = _para_to_rich(para)
+            if rich.strip():
+                current_lines.append(rich)
+
+    flush()
+    return blocks
 
 
-# ───────────────────────────────────────────────────────────────
-#  COVER PAGE
-# ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ARGUMENT GROUPING
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def build_cover(doc, target_summary, file_count, topic_info):
-    h0 = doc.add_heading("OpenCaselist Block Compilation", 0)
-    h0.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    if h0.runs:
-        h0.runs[0].font.color.rgb = RGBColor(0x1a, 0x5f, 0xa8)
+def _normalize(name):
+    return re.sub(r'\s+', ' ', name.lower().strip())
 
-    doc.add_paragraph()
 
-    for label, value in [
-        ("Caselist",      CASELIST),
-        ("Mode",          TARGET_MODE),
-        ("Targets",       target_summary),
-        ("Files",         str(file_count) + " unique round documents"),
-        ("Topic filter",  topic_info),
-        ("Generated",     datetime.now().strftime("%Y-%m-%d %H:%M")),
+def group_by_argument(all_blocks):
+    """
+    Collect blocks under canonical argument names.
+    Merges names where one is a substring of the other.
+    Returns dict sorted by block count descending.
+    """
+    raw = defaultdict(list)
+    for blk in all_blocks:
+        raw[blk["arg_name"]].append(blk)
+
+    canonical = {}
+    for key in sorted(raw.keys(), key=lambda k: -len(k)):
+        placed = False
+        for ckey in list(canonical.keys()):
+            nk, ck = _normalize(key), _normalize(ckey)
+            if nk in ck or ck in nk:
+                if len(raw.get(key, [])) > len(canonical[ckey]):
+                    canonical[key] = canonical.pop(ckey) + raw[key]
+                else:
+                    canonical[ckey] += raw[key]
+                placed = True
+                break
+        if not placed:
+            canonical[key] = raw[key]
+
+    return dict(sorted(canonical.items(), key=lambda kv: -len(kv[1])))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PDF GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BlockfilePDF(BaseDocTemplate):
+    def __init__(self, filename, **kw):
+        super().__init__(
+            filename,
+            pagesize=letter,
+            leftMargin=0.8*inch, rightMargin=0.8*inch,
+            topMargin=0.75*inch, bottomMargin=0.65*inch,
+            **kw,
+        )
+        body = Frame(
+            self.leftMargin,
+            self.bottomMargin + 0.2*inch,
+            self.width,
+            self.height - 0.2*inch,
+            id="body",
+        )
+        self.addPageTemplates([
+            PageTemplate(id="main", frames=[body], onPage=self._footer)
+        ])
+
+    def _footer(self, canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(C_LIGHT)
+        canvas.drawCentredString(
+            doc.pagesize[0] / 2, 0.32*inch,
+            f"PF Blockfile  |  Page {doc.page}"
+        )
+        canvas.restoreState()
+
+    def afterFlowable(self, flowable):
+        if getattr(flowable, "style", None) and flowable.style.name == "ArgHeading":
+            self.notify("TOCEntry", (0, flowable.getPlainText(), self.page))
+
+
+def _build_styles():
+    base = getSampleStyleSheet()
+    S = {}
+
+    def add(name, parent="Normal", **kw):
+        S[name] = ParagraphStyle(name, parent=base[parent], **kw)
+
+    add("CoverTitle", fontSize=34, fontName="Helvetica-Bold",
+        textColor=C_BLUE, alignment=TA_CENTER, leading=42, spaceAfter=6)
+    add("CoverSub",   fontSize=18, fontName="Helvetica",
+        textColor=C_MUTED, alignment=TA_CENTER, leading=24, spaceAfter=6)
+    add("CoverMeta",  fontSize=11, fontName="Helvetica",
+        textColor=C_MUTED, alignment=TA_CENTER, leading=19, spaceAfter=2)
+
+    add("TOCTitle",   fontSize=20, fontName="Helvetica-Bold",
+        textColor=C_BLUE, spaceAfter=10)
+
+    # Section heading — name must match afterFlowable check above
+    add("ArgHeading", fontSize=14, fontName="Helvetica-Bold",
+        textColor=white, leading=20, spaceBefore=14, spaceAfter=4,
+        backColor=C_BLUE, leftIndent=-4, rightIndent=-4,
+        borderPad=(4, 10, 4, 10))
+
+    add("SrcLine",    fontSize=9,  fontName="Helvetica-Bold",
+        textColor=C_BLUE, leading=13, spaceBefore=10, spaceAfter=1)
+    add("SrcMeta",    fontSize=8,  fontName="Helvetica",
+        textColor=C_LIGHT, leading=12, spaceAfter=4)
+
+    add("CardTag",    fontSize=9,  fontName="Helvetica-Bold",
+        textColor=C_MUTED, leading=13, spaceBefore=3, spaceAfter=1,
+        backColor=C_TAG_BG, leftIndent=4, borderPad=(2, 4, 2, 4))
+
+    add("CardBody",   fontSize=8.5, fontName="Helvetica",
+        textColor=C_MUTED, leading=13, spaceAfter=1, alignment=TA_JUSTIFY)
+
+    return S
+
+
+def _cover(story, S, targets, tournaments, n_blocks, n_args, slug):
+    story.append(Spacer(1, 1.2*inch))
+    story.append(Paragraph("PF Evidence Blockfile", S["CoverTitle"]))
+    story.append(Paragraph(_xml_escape(slug), S["CoverSub"]))
+    story.append(Spacer(1, 0.2*inch))
+    story.append(HRFlowable(width="55%", color=C_RULE, spaceAfter=14))
+    for label, val in [
+        ("Caselist",    CASELIST),
+        ("Targets",     targets),
+        ("Tournaments", " | ".join(sorted(tournaments)) if tournaments else "all"),
+        ("Arguments",   f"{n_args} unique AT: arguments"),
+        ("Blocks",      f"{n_blocks} rebuttal blocks"),
+        ("Generated",   datetime.now().strftime("%Y-%m-%d  %H:%M")),
     ]:
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        lb = p.add_run(f"{label}:  ")
-        lb.bold = True
-        lb.font.size = Pt(12)
-        vl = p.add_run(value)
-        vl.font.size = Pt(12)
-
-    doc.add_page_break()
+        story.append(Paragraph(
+            f"<b>{label}:</b>  {_xml_escape(str(val))}", S["CoverMeta"]
+        ))
+    story.append(PageBreak())
 
 
-# ───────────────────────────────────────────────────────────────
-#  PDF CONVERSION
-# ───────────────────────────────────────────────────────────────
-
-def convert_to_pdf(docx_path: Path):
-    pdf_path = docx_path.with_suffix(".pdf")
-
-    # Option 1: docx2pdf (Windows + MS Word)
-    try:
-        from docx2pdf import convert
-        print("[→] Converting to PDF via Microsoft Word (docx2pdf)...")
-        convert(str(docx_path), str(pdf_path))
-        if pdf_path.exists():
-            print(f"[✓] PDF saved: {pdf_path.resolve()}")
-            return
-    except ImportError:
-        print("[!] docx2pdf not installed — run: pip install docx2pdf")
-    except Exception as e:
-        print(f"[!] docx2pdf error: {e}")
-
-    # Option 2: LibreOffice headless
-    for cmd in ["soffice", "libreoffice",
-                r"C:\Program Files\LibreOffice\program\soffice.exe"]:
-        try:
-            res = subprocess.run(
-                [cmd, "--headless", "--convert-to", "pdf",
-                 "--outdir", str(docx_path.parent), str(docx_path)],
-                capture_output=True, timeout=120
-            )
-            if res.returncode == 0 and pdf_path.exists():
-                print(f"[✓] PDF saved via LibreOffice: {pdf_path.resolve()}")
-                return
-        except FileNotFoundError:
-            continue
-        except Exception:
-            continue
-
-    print("\n" + "=" * 55)
-    print("  DOCX saved but PDF conversion unavailable.")
-    print("  To get a PDF, either:")
-    print("    1.  pip install docx2pdf  (needs MS Word)")
-    print("    2.  Open the .docx in Word → Save As → PDF")
-    print(f"\n  DOCX is at: {docx_path.resolve()}")
-    print("=" * 55 + "\n")
+def _toc_page(story, S):
+    toc = TableOfContents()
+    toc.levelStyles = [
+        ParagraphStyle("TOCLevel0", fontSize=10, fontName="Helvetica",
+                       textColor=C_BLUE, leading=19, leftIndent=0, spaceAfter=2)
+    ]
+    toc.dotsMinLevel = 0
+    story.append(Paragraph("Table of Contents", S["TOCTitle"]))
+    story.append(toc)
+    story.append(PageBreak())
+    return toc
 
 
-# ───────────────────────────────────────────────────────────────
+def _fmt_source(src):
+    school = _xml_escape(src.get("school", ""))
+    team   = _xml_escape(src.get("team",   ""))
+    side   = "AFF" if src.get("side") == "A" else "NEG"
+    tourn  = _xml_escape((src.get("tournament") or "").lstrip("0123456789-– ").strip())
+    rnd    = _xml_escape(src.get("round",    ""))
+    opp    = _xml_escape(src.get("opponent", ""))
+    judge  = _xml_escape(src.get("judge",    ""))
+    line1  = f"{school}  /  {team}   ·   {side}   ·   {tourn}  —  Rd {rnd}"
+    parts  = []
+    if opp:   parts.append(f"vs {opp}")
+    if judge: parts.append(f"Judge: {judge}")
+    return line1, "   |   ".join(parts)
+
+
+def build_pdf(grouped, targets, tournaments, slug, out_path):
+    S        = _build_styles()
+    n_blocks = sum(len(v) for v in grouped.values())
+    n_args   = len(grouped)
+    story    = []
+
+    _cover(story, S, targets, tournaments, n_blocks, n_args, slug)
+    _toc_page(story, S)
+
+    for arg_name, blocks in grouped.items():
+        label = f"AT:  {arg_name}   ({len(blocks)} block{'s' if len(blocks)!=1 else ''})"
+        story.append(Paragraph(label, S["ArgHeading"]))
+        story.append(HRFlowable(width="100%", color=C_RULE, thickness=0.5, spaceAfter=2))
+
+        for blk in blocks:
+            l1, l2 = _fmt_source(blk["source"])
+            hdr = [Paragraph(l1, S["SrcLine"])]
+            if l2:
+                hdr.append(Paragraph(l2, S["SrcMeta"]))
+            hdr.append(HRFlowable(width="100%", color=C_RULE,
+                                  thickness=0.5, spaceAfter=3))
+
+            body = []
+            for line in blk["lines"]:
+                is_tag = (line.startswith("<b>") and line.endswith("</b>")
+                          and len(line) < 500)
+                style  = S["CardTag"] if is_tag else S["CardBody"]
+                try:
+                    body.append(Paragraph(line, style))
+                except Exception:
+                    plain = re.sub(r'<[^>]+>', '', line)
+                    if plain.strip():
+                        body.append(Paragraph(_xml_escape(plain), style))
+
+            body.append(Spacer(1, 0.10*inch))
+
+            # Keep attribution + first few lines together
+            story.append(KeepTogether(hdr + body[:5]))
+            for e in body[5:]:
+                story.append(e)
+
+        story.append(PageBreak())
+
+    doc = BlockfilePDF(str(out_path))
+    doc.multiBuild(story)
+    print(f"\n  PDF saved: {out_path.resolve()}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN
-# ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global TARGET_MODE, SPECIFIC_TEAMS, SPECIFIC_SCHOOLS, DAYS_RECENT, TOPIC_KEYWORDS
+    mode, spec = prompt_targets()
+    slug       = prompt_slug()
 
-    print(f"\n{'='*60}")
-    print("  OpenCaselist Scraper v2 (Interactive)")
-    print(f"  caselist={CASELIST}")
-    print(f"{'='*60}")
+    print()
+    print("="*62)
+    print(f"  Tournament filter: {' | '.join(TOURNAMENT_FILTER) if TOURNAMENT_FILTER else 'none (all)'}")
+    print("="*62 + "\n")
 
-    # 0) Prompt for mode and config
-    TARGET_MODE, updates = prompt_for_target_mode()
-    for k, v in updates.items():
-        globals()[k] = v
-
-    # Optional: apply topic filter on top of any mode (including teams/school/recent)
-    extra_filter = prompt_optional_topic_filter()
-    if extra_filter is not None:
-        TOPIC_KEYWORDS = extra_filter
-
-    print(f"\n[→] Running with mode={TARGET_MODE}")
-    if TOPIC_KEYWORDS:
-        print(f"[→] Topic filter: {TOPIC_KEYWORDS}")
-
-    # 1) Resolve targets
-    team_data = resolve_targets()
+    print("Resolving targets...")
+    team_data = resolve_targets(mode, spec)
     if not team_data:
-        print("[!] No targets resolved. Check configuration/mode.")
+        print("\n[!] No targets resolved.")
+        print("    Check: team name spelling, CASELIST_TOKEN expiry, tournament filter.")
         return
-    print(f"\n[✓] {len(team_data)} teams resolved\n")
 
-    # 2) Collect unique files per team
+    print(f"\n  {len(team_data)} team(s) resolved")
+
     all_metas = []
-    for (school, team, rounds) in team_data:
+    for school, team, rounds in team_data:
         unique = dedup_rounds(rounds)
-        print(f"  {school}/{team}: {len(unique)} unique files")
+        print(f"  {school} / {team} : {len(unique)} file(s)")
         for rnd in unique:
-            if "opensource" not in rnd or not rnd["opensource"]:
+            if not rnd.get("opensource"):
                 continue
             all_metas.append({
                 "school":     school,
                 "team":       team,
                 "tournament": rnd.get("tournament", ""),
-                "round":      rnd.get("round", ""),
-                "side":       rnd.get("side", ""),
-                "opponent":   rnd.get("opponent", ""),
-                "judge":      rnd.get("judge", ""),
-                "report":     rnd.get("report", ""),
+                "round":      rnd.get("round",      ""),
+                "side":       rnd.get("side",        ""),
+                "opponent":   rnd.get("opponent",    ""),
+                "judge":      rnd.get("judge",       ""),
                 "opensource": rnd["opensource"],
-                "created_at": rnd.get("created_at", ""),
             })
 
-    print(f"\n[→] Downloading {len(all_metas)} files...\n")
-    downloaded = []
-    for meta in all_metas:
-        data = download_file(meta["opensource"])
-        if data:
-            downloaded.append((meta, data))
-
-    print(f"\n[✓] {len(downloaded)} files ready\n")
-    if not downloaded:
-        print("[!] Nothing to compile.")
+    if not all_metas:
+        print("\n[!] No files found. Check tournament filter or token.")
         return
 
-    # 3) Build output DOCX
-    print("[→] Building output document (original formatting preserved)...")
-    out_doc = Document()
-    for section in out_doc.sections:
-        section.top_margin    = Inches(0.75)
-        section.bottom_margin = Inches(0.75)
-        section.left_margin   = Inches(0.85)
-        section.right_margin  = Inches(0.85)
+    print(f"\n  {len(all_metas)} file(s) to process\n")
 
-    # Cover
-    target_summary = (
-        ", ".join(f"{s}/{t}" for s, t, _ in team_data)
-        if len(team_data) <= 5 else f"{len(team_data)} teams"
-    )
-    topic_info = (
-        " | ".join(TOPIC_KEYWORDS) if TOPIC_KEYWORDS
-        else "none (all rounds included)"
-    )
-    build_cover(out_doc, target_summary, len(downloaded), topic_info)
+    all_blocks       = []
+    tournaments_seen = set()
+    failed           = 0
 
-    # Group by tournament
-    by_tourn = defaultdict(list)
-    for (meta, data) in downloaded:
+    for i, meta in enumerate(all_metas, 1):
         tourn = meta["tournament"].lstrip("0123456789-– ").strip() or "Unknown"
-        by_tourn[tourn].append((meta, data))
+        print(f"  [{i:3d}/{len(all_metas)}]  {meta['school']}/{meta['team']}  ·  {tourn}")
+        data = download_file(meta["opensource"])
+        if not data:
+            failed += 1
+            continue
+        tournaments_seen.add(tourn)
+        blocks = extract_blocks(data, meta)
+        print(f"           -> {len(blocks)} block(s) extracted")
+        all_blocks.extend(blocks)
 
-    for tourn_name, entries in by_tourn.items():
-        h = out_doc.add_heading(tourn_name, level=1)
-        if h.runs:
-            h.runs[0].font.color.rgb = RGBColor(0x1a, 0x5c, 0xa8)
+    print(f"\n  {len(all_blocks)} total blocks from {len(all_metas)-failed} files")
+    if failed:
+        print(f"  {failed} file(s) failed to download")
 
-        for (meta, data) in entries:
-            n = copy_docx_into(data, out_doc, meta)
-            print(f"  ✓  {Path(meta['opensource']).name}  ({n} paragraphs)")
+    if not all_blocks:
+        print("\n[!] No blocks found.")
+        print("    The files may not have 2AC/2NC sections with AT: headings,")
+        print("    or the tournament filter excluded everything.")
+        return
 
-        out_doc.add_page_break()
+    print("\nGrouping by argument...")
+    grouped = group_by_argument(all_blocks)
+    print(f"  {len(grouped)} unique argument(s)\n")
+    for arg, blks in list(grouped.items())[:20]:
+        print(f"    AT: {arg:<45s}  {len(blks)} block(s)")
+    if len(grouped) > 20:
+        print(f"    ... and {len(grouped)-20} more")
 
-    # 4) Save
-    docx_path = OUTPUT_DIR / f"{OUTPUT_NAME}.docx"
-    out_doc.save(str(docx_path))
-    print(f"\n[✓] DOCX saved: {docx_path.resolve()}")
+    if mode == "teams":
+        targets = ", ".join(f"{s}/{t}" for s, t in spec)
+    elif mode == "school":
+        targets = ", ".join(spec)
+    else:
+        targets = f"recent ({spec} days)"
 
-    # 5) PDF
-    convert_to_pdf(docx_path)
+    out_path = OUTPUT_DIR / f"blockfile_{slug}.pdf"
+    print(f"\nBuilding PDF -> {out_path.name}")
+    build_pdf(grouped, targets, tournaments_seen, slug, out_path)
 
-    print(f"\n{'='*60}")
-    print(f"  Done!  Folder: {OUTPUT_DIR.resolve()}")
-    print(f"{'='*60}\n")
+    print()
+    print("="*62)
+    print(f"  DONE!")
+    print(f"  Arguments : {len(grouped)}")
+    print(f"  Blocks    : {len(all_blocks)}")
+    print(f"  Output    : {out_path.resolve()}")
+    print("="*62 + "\n")
 
 
 if __name__ == "__main__":
