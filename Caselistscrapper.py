@@ -22,9 +22,11 @@ import hashlib, io, json, re, time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote as _url_quote
 
 import requests
 from docx import Document
+from docx.oxml.ns import qn as _qn
 
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -44,12 +46,12 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CASELIST_TOKEN = "375582f6bb7183c0cb5e6a8ce306a8c1"
+CASELIST_TOKEN = "19f45544d770ef865eade0c3575af607"
 CASELIST       = "hspf25"
 
 # Tournaments to INCLUDE (case-insensitive substring match).
 # Set to [] to include everything.
-TOURNAMENT_FILTER = ["Harvard", "Berkeley", "Stanford", "Bellaire", "Pennsbury"]
+TOURNAMENT_FILTER = ["Harvard", "Berkeley", "Stanford", "Bellaire", "Pennsbury", "Cal", "California", "Cal RR"]
 
 # Tournaments to always EXCLUDE even if they match the filter above.
 TOURNAMENT_EXCLUDE = [
@@ -217,71 +219,215 @@ def prompt_slug():
 #  API + DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def api_get(url, retries=3):
+def _enc(s: str) -> str:
+    """URL-encode a school or team slug for use in API paths."""
+    return _url_quote(str(s), safe='')
+
+
+def api_get(url, retries=3, _label=""):
+    """GET url, return parsed JSON or None.  Prints a warning on non-404 failure."""
     for attempt in range(retries):
         try:
             r = session.get(url, timeout=15)
             if r.status_code == 429:
-                time.sleep(10 * (attempt + 1))
+                wait = 10 * (attempt + 1)
+                print(f"    [rate-limit] waiting {wait}s ...")
+                time.sleep(wait)
                 continue
             if r.status_code == 404:
                 return None
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as e:
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
+            else:
+                tag = f" [{_label}]" if _label else ""
+                print(f"    [api-err]{tag} {e}")
     return None
 
 
 def fetch_all_schools():
-    data = api_get(f"{API_BASE}/caselists/{CASELIST}/schools")
+    data = api_get(f"{API_BASE}/caselists/{CASELIST}/schools", _label="schools")
     if not data:
+        print("  [!] Could not fetch school list from API.")
         return []
-    return data if isinstance(data, list) else data.get("schools", [])
+    schools = data if isinstance(data, list) else data.get("schools", [])
+    print(f"  [api] {len(schools)} schools found in caselist")
+    return schools
 
 
-def fetch_teams_in_school(school):
-    data = api_get(f"{API_BASE}/caselists/{CASELIST}/schools/{school}/teams")
-    if not data:
+def _parse_team_obj(obj) -> str:
+    """
+    Extract team slug from whatever shape the API returns.
+    Handles: bare string, {team:...}, {teamname:...}, {name:...}, {slug:...}
+    """
+    if isinstance(obj, str):
+        return obj.strip()
+    for key in ("team", "teamname", "name", "slug", "code"):
+        v = obj.get(key, "")
+        if v:
+            return str(v).strip()
+    return ""
+
+
+def fetch_teams_in_school(school: str) -> list:
+    """
+    Fetch all teams for a school, with caching, fallback URL, and diagnostics.
+    Returns a list of team-slug strings.
+    """
+    key   = hashlib.md5(f"teams_{CASELIST}_{school}".encode()).hexdigest()
+    cache = CACHE_DIR / f"teams_{key}.json"
+
+    # Use cached copy if fresh (< 2 hours)
+    if cache.exists() and (time.time() - cache.stat().st_mtime) < 7200:
+        raw = json.loads(cache.read_text())
+        teams = [_parse_team_obj(o) for o in raw]
+        teams = [t for t in teams if t]
+        return teams
+
+    # Try primary endpoint
+    data = api_get(
+        f"{API_BASE}/caselists/{CASELIST}/schools/{_enc(school)}/teams",
+        _label=f"{school}/teams",
+    )
+
+    # Fallback: some caselists use a flat /teams?school=... query param
+    if data is None:
+        data = api_get(
+            f"{API_BASE}/caselists/{CASELIST}/teams?school={_enc(school)}",
+            _label=f"{school}/teams-fallback",
+        )
+
+    if data is None:
+        print(f"    [!] No team data returned for school: {school!r}")
+        print(f"        Check that the school name matches exactly what OpenCaselist uses.")
+        print(f"        Tip: look at a round URL to find the exact slug, e.g. 'TheNuevaSchool'")
         return []
-    return data if isinstance(data, list) else data.get("teams", [])
+
+    raw = data if isinstance(data, list) else data.get("teams", [])
+    if not raw:
+        print(f"    [!] API returned 0 teams for school: {school!r}")
+        return []
+
+    # Cache the raw response
+    cache.write_text(json.dumps(raw))
+
+    teams = [_parse_team_obj(o) for o in raw]
+    teams = [t for t in teams if t]
+    print(f"    [api] {len(teams)} team(s) found for {school!r}")
+    return teams
 
 
-def fetch_rounds(school, team):
+def _find_school_slugs(query: str) -> list:
+    """
+    Search all schools in the caselist for ones whose slug contains `query`
+    (case-insensitive).  Returns list of matching slug strings.
+    Caches the full school list for 2 hours.
+    """
+    key   = hashlib.md5(f"allschools_{CASELIST}".encode()).hexdigest()
+    cache = CACHE_DIR / f"schools_{key}.json"
+
+    if cache.exists() and (time.time() - cache.stat().st_mtime) < 7200:
+        raw = json.loads(cache.read_text())
+    else:
+        print("  [api] Fetching full school list to search ...")
+        data = api_get(f"{API_BASE}/caselists/{CASELIST}/schools", _label="all-schools")
+        if not data:
+            print("  [!] Could not fetch school list.")
+            return []
+        raw = data if isinstance(data, list) else data.get("schools", [])
+        cache.write_text(json.dumps(raw))
+
+    def _slug(obj):
+        if isinstance(obj, str): return obj
+        for k in ("name", "slug", "school", "id"):
+            if obj.get(k): return str(obj[k])
+        return ""
+
+    all_slugs = [_slug(o) for o in raw]
+    all_slugs = [s for s in all_slugs if s]
+
+    q = query.lower().replace(" ", "").replace("-", "")
+    matches = [s for s in all_slugs
+               if q in s.lower().replace(" ", "").replace("-", "")]
+    return matches
+
+
+def fetch_rounds(school: str, team: str) -> list:
+    """
+    Fetch rounds for a school/team with caching and a fallback URL.
+    """
     key  = hashlib.md5(f"{CASELIST}{school}{team}".encode()).hexdigest()
     path = CACHE_DIR / f"rounds_{key}.json"
     if path.exists() and (time.time() - path.stat().st_mtime) < 3600:
         return json.loads(path.read_text())
-    data = api_get(f"{API_BASE}/caselists/{CASELIST}/schools/{school}/teams/{team}/rounds")
+
+    # Primary endpoint
+    data = api_get(
+        f"{API_BASE}/caselists/{CASELIST}/schools/{_enc(school)}/teams/{_enc(team)}/rounds",
+        _label=f"{school}/{team}/rounds",
+    )
+    # Fallback endpoint (older API layout)
     if data is None:
-        data = api_get(f"{API_BASE}/caselists/{CASELIST}/teams/{school}/{team}/rounds")
+        data = api_get(
+            f"{API_BASE}/caselists/{CASELIST}/teams/{_enc(school)}/{_enc(team)}/rounds",
+            _label=f"{school}/{team}/rounds-fallback",
+        )
+
     if not data:
         return []
+
     rounds = data if isinstance(data, list) else data.get("rounds", [])
     path.write_text(json.dumps(rounds))
     time.sleep(0.3)
     return rounds
 
 
+
+def _is_docx(data: bytes) -> bool:
+    return data[:4] == b'PK\x03\x04'
+
+def _is_pdf(data: bytes) -> bool:
+    return data[:4] == b'%PDF'
+
 def download_file(path: str):
-    key    = hashlib.md5(path.encode()).hexdigest()
-    cached = CACHE_DIR / f"{key}.docx"
-    if cached.exists():
-        return cached.read_bytes()
+    """
+    Download a file from OpenCaselist.  Accepts both .docx and .pdf.
+    File type is determined by magic bytes, not the path extension,
+    because some entries have mismatched extensions.
+    Returns (bytes, 'docx'|'pdf') or (None, None) on failure.
+    """
+    key = hashlib.md5(path.encode()).hexdigest()
+
+    # Check both possible cached extensions
+    for ext in ('.docx', '.pdf'):
+        cached = CACHE_DIR / f"{key}{ext}"
+        if cached.exists():
+            return cached.read_bytes(), ext[1:]   # strip leading dot
+
     print(f"    [down] {Path(path).name}")
     for attempt in range(3):
         try:
             r = session.get(f"{API_BASE}/download", params={"path": path}, timeout=30)
-            if r.status_code == 200 and r.content[:4] == b'PK\x03\x04':
-                cached.write_bytes(r.content)
-                time.sleep(0.6)
-                return r.content
+            if r.status_code == 200:
+                data = r.content
+                if _is_docx(data):
+                    (CACHE_DIR / f"{key}.docx").write_bytes(data)
+                    time.sleep(0.6)
+                    return data, 'docx'
+                if _is_pdf(data):
+                    (CACHE_DIR / f"{key}.pdf").write_bytes(data)
+                    time.sleep(0.6)
+                    return data, 'pdf'
+                # Unknown format — skip
+                print(f"    [SKIP] {Path(path).name} — unknown format")
+                return None, None
             time.sleep(2 ** attempt)
         except Exception:
             time.sleep(2 ** attempt)
     print(f"    [FAIL] {Path(path).name}")
-    return None
+    return None, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -290,12 +436,10 @@ def download_file(path: str):
 
 def _matches_tournament(rnd):
     name = (rnd.get("tournament") or "").strip()
-    # Check exclusion list first (case-insensitive)
     name_lower = name.lower()
     for excl in TOURNAMENT_EXCLUDE:
         if excl.lower() in name_lower:
             return False
-    # Then check inclusion filter
     if not TOURNAMENT_FILTER:
         return True
     return any(f.lower() in name_lower for f in TOURNAMENT_FILTER)
@@ -319,12 +463,42 @@ def resolve_targets(mode, spec):
 
     elif mode == "school":
         for school in spec:
-            print(f"  [->] School: {school}")
-            for obj in fetch_teams_in_school(school):
-                team = obj if isinstance(obj, str) else obj.get("team", "")
-                if team:
-                    results.append((school, team, fetch_rounds(school, team)))
-                    time.sleep(0.2)
+            print(f"\n  [->] School: {school}")
+            teams = fetch_teams_in_school(school)
+
+            # If no teams, try fuzzy search
+            if not teams:
+                print(f"      [!] No teams found for slug {school!r}.")
+                print(f"          Searching for similar school names ...")
+                matches = _find_school_slugs(school)
+                if not matches:
+                    print(f"          No similar schools found. Check spelling.")
+                    continue
+                if len(matches) == 1:
+                    school = matches[0]
+                    print(f"          Auto-selected: {school!r}")
+                    teams = fetch_teams_in_school(school)
+                else:
+                    print(f"          Found {len(matches)} possible matches:")
+                    for i, m in enumerate(matches[:10], 1):
+                        print(f"            {i}. {m}")
+                    raw = input("          Pick a number (or Enter to skip): ").strip()
+                    try:
+                        school = matches[int(raw) - 1]
+                        teams  = fetch_teams_in_school(school)
+                    except (ValueError, IndexError):
+                        print("          Skipping.")
+                        continue
+
+            if not teams:
+                print(f"      [!] Still no teams found for {school!r}. Skipping.")
+                continue
+
+            print(f"      Found {len(teams)} team(s) — running as mode 1 targets:")
+            for team in teams:
+                print(f"        [->] {school} / {team}")
+                results.append((school, team, fetch_rounds(school, team)))
+                time.sleep(0.2)
 
     elif mode == "recent":
         days   = spec
@@ -357,62 +531,58 @@ def _is_recent(rnd, cutoff):
 #  BLOCK EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── Speech section recognition ────────────────────────────────────────────────
-# Rebuttal speech labels — these speeches contain blocks we want to extract
 _REBUTTAL_SPEECH_RE = re.compile(
     r'^(2AC|2NC|1AR|2AR|1NR|NEG\s*BLOCK|AFF\s*BLOCK|'
     r'REBUTTAL|ANSWERS?\s+TO|BLOCKS?|OFF\s*CASE)',
     re.IGNORECASE,
 )
-# Constructive speech labels — skip content inside these
 _CONSTRUCTIVE_SPEECH_RE = re.compile(
     r'^(1AC|1NC)(?:\s|$|-)',
     re.IGNORECASE,
 )
-# "Defense" / "Extensions" section — auto-block mode: every sub-heading is a block
 _DEFENSE_SECTION_RE = re.compile(
     r'^(DEFENSE|EXTENSIONS?)',
     re.IGNORECASE,
 )
 
-# Backwards compat alias used elsewhere
 _REBUTTAL_RE = _REBUTTAL_SPEECH_RE
 
-# ─── AT: prefix detection (many forms) ─────────────────────────────────────────
-# Handles:
-#   "AT: State Revenue"              standard
-#   "A2: Nuclear War"                standard alternate
-#   "A/2 Monopolies"                 no colon form
-#   "Answers to: X"                  spelled-out form
-#   "2AC---AT: Illegal Betting"      speech label embedded before AT:
-#   "2NC - A2: Econ"
 _AT_PREFIX_RE = re.compile(
     r'^(?:'
-    # Standard forms with colon: AT:  A2:  A/2:  Answers to:
     r'(?:AT|A2|A/2|ANS(?:WER)?S?(?:\s+TO)?)\s*[:\-]\s*'
     r'|'
-    # Speech-embedded: "2AC---AT:", "2NC - A2:", "1AR: AT:", etc.
     r'(?:2AC|2NC|1AR|2AR|1NR)\s*[-—:]+\s*(?:AT|A2|A/2)\s*[:\-]?\s*'
     r')',
     re.IGNORECASE,
 )
 
-# "A/2 X" or "A2 X" without any colon (common in flat/PDF-origin docs)
 _A2_NOCOLON_RE = re.compile(
     r'^(?:A/2|A2)\s+(?=\S)',
     re.IGNORECASE,
 )
 
-# Trailing junk to strip from argument names
 _TAIL_JUNK_RE = re.compile(
     r'\s*[-–—]+\s*(2AC|2NC|1AR|2AR|1NR|Extra|Add\s*[Oo]n|Topshelf).*$',
     re.IGNORECASE,
 )
 
-# Citation tagline: "Lastname YY" or "Smith et al 23" at paragraph start
-# Captures the short cite that debaters read aloud (size 11 bold)
 _CITE_TAG_RE = re.compile(
-    r'^([A-Z][A-Za-z\-]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][A-Za-z\-]+))?\s+\d{2})\b'
+    r'''^(
+        # ── Author token: last name OR org abbreviation ──────────────────────
+        (?:
+            [A-Z]{2,}(?:\s+[A-Z]{2,})*          # ALL-CAPS org: USC, FTC, DOJ, US Code
+          | [A-Z][A-Za-z\u2019\'\-]+             # Capitalized last name: Hendricks, O'Brien
+            (?:\s+(?:
+                et\s+al\.?                       # "et al." / "et al"
+              | and\s+[A-Z][A-Za-z\-]+           # "and Smith"
+              | [A-Z][A-Za-z\-]+                 # second last name
+            ))?
+        )
+        # ── Year token: bare YY or apostrophe 'YY ────────────────────────────
+        \s+[\'\u2018\u2019]?\d{2}               # 21  '21  '06
+    )
+    \b''',
+    re.VERBOSE,
 )
 
 
@@ -434,12 +604,107 @@ def _xml_escape(text):
             .replace('"', "&quot;"))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  XML-AWARE RUN FORMATTING HELPERS
+#  These replace the old bool(run.bold) / bool(run.underline) checks which
+#  silently return False when the value is None (meaning "inherit from style").
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_is_bold(run):
+    """
+    True if the run is bold.  Checks the python-docx API first, then falls
+    back to the raw <w:b> XML element so that inherited / XML-only bold is
+    not missed.
+    """
+    val = run.bold          # True / False / None
+    if val is not None:
+        return bool(val)
+    rPr = run._r.find(_qn('w:rPr'))
+    if rPr is not None:
+        b = rPr.find(_qn('w:b'))
+        if b is not None:
+            w_val = b.get(_qn('w:val'))
+            # absent val, "true", or "1" → bold; "0" or "false" → not bold
+            return w_val not in ('0', 'false')
+    return False
+
+
+def _run_is_underline(run):
+    """
+    True if the run has any underline style.  Handles None (inherit) and
+    WD_UNDERLINE enum values that python-docx can return.
+    """
+    val = run.underline     # True / False / None / WD_UNDERLINE.*
+    if val is True:
+        return True
+    if val is False:
+        return False
+    if val is None:
+        # Fall back to raw XML
+        rPr = run._r.find(_qn('w:rPr'))
+        if rPr is not None:
+            u = rPr.find(_qn('w:u'))
+            if u is not None:
+                w_val = u.get(_qn('w:val'))
+                # 'none' / '0' / 'false' → explicitly no underline
+                return w_val not in ('none', '0', 'false', None)
+        return False
+    # Any WD_UNDERLINE enum value other than NONE means underlined
+    try:
+        from docx.enum.text import WD_UNDERLINE
+        return val != WD_UNDERLINE.NONE
+    except Exception:
+        return True
+
+
+def _run_highlight(run):
+    """
+    Return the mapped hex highlight color for a run, or None.
+
+    Checks in order:
+      1. python-docx highlight_color API  (works when Word sets highlight_color)
+      2. Raw <w:highlight> XML element    (often missed by the API in older files)
+      3. <w:shd> shading fill             (some Word versions store highlights here)
+    """
+    # 1. python-docx API path
+    h = run.font.highlight_color
+    if h:
+        hl_name = str(h).split()[0]
+        mapped = _HIGHLIGHT_COLORS.get(hl_name)
+        if mapped:
+            return mapped
+
+    rPr = run._r.find(_qn('w:rPr'))
+    if rPr is None:
+        return None
+
+    # 2. <w:highlight val="yellow"/> etc.
+    hl_elem = rPr.find(_qn('w:highlight'))
+    if hl_elem is not None:
+        w_val = (hl_elem.get(_qn('w:val')) or '').upper()
+        if w_val and w_val != 'NONE':
+            return _HIGHLIGHT_COLORS.get(w_val, "#cce8ff")
+
+    # 3. <w:shd w:fill="RRGGBB"/> — some exporters store yellow highlight as shading
+    shd = rPr.find(_qn('w:shd'))
+    if shd is not None:
+        fill = (shd.get(_qn('w:fill')) or '').upper()
+        # Ignore white / auto / empty
+        if fill and fill not in ('AUTO', 'FFFFFF', ''):
+            return "#cce8ff"
+
+    return None
+
+
 def _run_tier(run):
     """
-    Classify a run: bold+underline → 'read', underline → 'context', else → 'filler'.
+    Classify a run using XML-aware helpers:
+      bold + underline → 'read'
+      underline only   → 'context'
+      everything else  → 'filler'
     """
-    bold      = bool(run.bold)
-    underline = bool(run.underline)
+    bold      = _run_is_bold(run)
+    underline = _run_is_underline(run)
     if bold and underline:
         return "read"
     if underline:
@@ -448,9 +713,12 @@ def _run_tier(run):
 
 
 def _has_highlight(run):
-    h = run.font.highlight_color
-    return h and str(h).split()[0] in _HIGHLIGHT_COLORS
+    return _run_highlight(run) is not None
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RICH TEXT RENDERING
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _format_run_fragment(text, bold=False, underline=False, highlight_bg=None, size=None):
     """Build a ReportLab rich-text span for a fragment of text."""
@@ -474,90 +742,96 @@ def _para_to_rich(para):
     Convert a paragraph's runs to a ReportLab rich-text string.
 
     Sizing rules:
-      • Underlined OR highlighted  →  size 11
-      • Everything else            →  size 8
-    Bold/underline markup is preserved on top of sizing.
-    All text uses Calibri.
+      • Bold + underlined           →  size 11  (read aloud — core warrant)
+      • Underlined OR highlighted   →  size 11  (context)
+      • Everything else             →  size 8   (filler)
 
     Citation tagline detection:
-      If the paragraph text starts with "Lastname YY" (e.g. "Donnelly 23"),
-      that short cite fragment is rendered size 11 bold regardless of run
-      formatting, and the remainder of the citation body stays at size 8.
+      The opening "Author YY" token (e.g. "Hendricks 21", "USC '06",
+      "Smith et al. 23") is ALWAYS rendered bold size 11 regardless of
+      how the run is formatted in the source docx.  The regex covers:
+        • Capitalized last name  →  Hendricks 21 / O'Brien 19
+        • ALL-CAPS org/statute   →  USC '06 / FTC 22 / US Code 06
+        • et al. / and Smith     →  Johnson et al. 24
+        • Apostrophe years       →  '06  '21  \u201921
     """
-    full_text = para.text  # preserve leading spaces for position tracking
-    cite_m = _CITE_TAG_RE.match(full_text.lstrip())
-    # Adjust match position for any leading whitespace
-    leading_ws = len(full_text) - len(full_text.lstrip())
-    cite_end = (leading_ws + cite_m.end(1)) if cite_m else 0
+    full_text  = para.text
+    stripped   = full_text.lstrip()
+    leading_ws = len(full_text) - len(stripped)
+    cite_m     = _CITE_TAG_RE.match(stripped)
+    # cite_end is the char index in full_text up to which text is the citation token
+    cite_end   = (leading_ws + cite_m.end(1)) if cite_m else 0
 
-    parts = []
-    char_pos = 0  # character position within para.text
+    parts    = []
+    char_pos = 0
 
     for run in para.runs:
         t = run.text
         if not t:
+            # Still advance position even for empty runs
             char_pos += len(t)
             continue
 
-        bold      = bool(run.bold)
-        underline = bool(run.underline)
-        h         = run.font.highlight_color
-        hl_name   = str(h).split()[0] if h else None
-        hl_bg     = _HIGHLIGHT_COLORS.get(hl_name) if hl_name else None
+        # Use XML-aware helpers — never raw bool(run.bold) / bool(run.underline)
+        bold      = _run_is_bold(run)
+        underline = _run_is_underline(run)
+        hl_bg     = _run_highlight(run)
 
         run_start = char_pos
         run_end   = char_pos + len(t)
 
         if cite_end > 0 and run_start < cite_end:
-            # Split the run at the cite boundary
-            split = min(cite_end - run_start, len(t))
-            prefix_text = t[:split]
-            rest_text   = t[split:]
+            # This run overlaps with the citation token — split if necessary
+            split_at    = min(cite_end - run_start, len(t))
+            cite_text   = t[:split_at]
+            rest_text   = t[split_at:]
 
-            if prefix_text:
-                # Citation "Lastname YY" → always size 11 bold
+            if cite_text:
+                # Citation portion: ALWAYS bold size 11, no underline
                 parts.append(_format_run_fragment(
-                    prefix_text, bold=True, underline=False,
+                    cite_text, bold=True, underline=False,
                     highlight_bg=hl_bg, size=SZ_READ))
 
             if rest_text:
-                sz = SZ_READ if (underline or hl_bg) else SZ_FILLER
+                # If highlighted → force read-aloud tier (bold+underline+size11)
+                eff_bold      = bold or bool(hl_bg)
+                eff_underline = underline or bool(hl_bg)
+                sz = SZ_READ if (eff_bold and eff_underline) or underline or hl_bg else SZ_FILLER
                 parts.append(_format_run_fragment(
-                    rest_text, bold=bold, underline=underline,
+                    rest_text, bold=eff_bold, underline=eff_underline,
                     highlight_bg=hl_bg, size=sz))
         else:
-            # Normal run: size 11 if underlined or highlighted, else size 8
-            sz = SZ_READ if (underline or hl_bg) else SZ_FILLER
-            parts.append(_format_run_fragment(
-                t, bold=bold, underline=underline,
-                highlight_bg=hl_bg, size=sz))
+            # Normal run outside citation zone.
+            # Rule: highlighted text → read-aloud tier (bold + underline + size 11)
+            # This handles teams who only apply highlight without bold/underline in their docx.
+            if hl_bg:
+                # Highlighted → force bold+underline regardless of docx formatting
+                parts.append(_format_run_fragment(
+                    t, bold=True, underline=True,
+                    highlight_bg=hl_bg, size=SZ_READ))
+            elif bold and underline:
+                parts.append(_format_run_fragment(
+                    t, bold=True, underline=True,
+                    highlight_bg=None, size=SZ_READ))
+            elif underline:
+                parts.append(_format_run_fragment(
+                    t, bold=False, underline=True,
+                    highlight_bg=None, size=SZ_CONTEXT))
+            else:
+                parts.append(_format_run_fragment(
+                    t, bold=False, underline=False,
+                    highlight_bg=None, size=SZ_FILLER))
 
         char_pos = run_end
 
     return "".join(parts)
 
 
-
-
 def _try_get_block_name(text):
-    """
-    Extract a clean block/argument name from a heading using any known AT: pattern.
-
-    Handles all observed disclosure styles:
-      "AT: State Revenue"                   → "State Revenue"
-      "A2: Nuclear War"                     → "Nuclear War"
-      "A/2 Monopolies"                      → "Monopolies"       (no colon)
-      "Answers to: X"                       → "X"
-      "2AC---AT: Illegal Betting"           → "Illegal Betting"  (speech prefix embedded)
-      "2NC - A2: Econ DA"                   → "Econ DA"
-    Returns None if text doesn't match any AT: pattern.
-    """
-    # Standard + speech-embedded AT: prefix
     if _AT_PREFIX_RE.match(text):
         name = _AT_PREFIX_RE.sub("", text).strip()
         name = _TAIL_JUNK_RE.sub("", name).strip().rstrip("-–— ").strip()
         return name or None
-    # "A/2 X" or "A2 X" without colon
     if _A2_NOCOLON_RE.match(text):
         name = _A2_NOCOLON_RE.sub("", text).strip()
         name = _TAIL_JUNK_RE.sub("", name).strip()
@@ -565,51 +839,333 @@ def _try_get_block_name(text):
     return None
 
 
-# Keep old name as alias for any code that might reference it
-_clean_arg_name = _try_get_block_name
-
-
-def extract_blocks(docx_bytes, source_meta):
+def extract_blocks_pdf(pdf_bytes, source_meta):
     """
-    Parse a debate .docx and return rebuttal blocks.
+    Extract rebuttal blocks from a PDF file.
 
-    Supports all observed open-source disclosure formats:
+    Strategy
+    --------
+    PDFs don't have a structured DOM like docx — formatting is encoded as:
+      • Font name   → bold if "Bold" / "Heavy" / "Black" in name
+      • Font size   → used to infer heading level
+      • Annotations → highlight / underline stored as page annotation rects
 
-    ┌─────────────────────────────────────────────────────────────────┐
-    │ Style A  —  Classic hierarchy (H1 = speech label)              │
-    │   H1: 2NC / 2AC / 1AR …      → enter rebuttal mode            │
-    │   H2/H3: AT: [block name]    → new block                       │
-    │   H4: card tag               → card sub-header                 │
-    │   Normal: card body                                             │
-    ├─────────────────────────────────────────────────────────────────┤
-    │ Style B  —  Speech at H2 (Nueva School, Harker)                │
-    │   H1: round title                                               │
-    │   H2: 2AC / 2NC / 1NC …     → enter/exit rebuttal mode        │
-    │   H3: 2AC---AT: [block]     → new block (strips speech prefix) │
-    │       or: AT: [block]                                           │
-    │   H4: claim / card tag                                          │
-    │   Normal: card body                                             │
-    ├─────────────────────────────────────────────────────────────────┤
-    │ Style C  —  Defense section (Fairmont Prep)                    │
-    │   H2: Defense / Extensions   → defense mode (auto-block)       │
-    │   H3/H4: [argument name]    → block name (no AT: needed)       │
-    │   Normal: card body                                             │
-    ├─────────────────────────────────────────────────────────────────┤
-    │ Style D  —  Flat Normal text (some older files)                │
-    │   Normal "2NC" / "2AC" alone → enter rebuttal mode             │
-    │   Normal "AT: [arg]"          → new block                      │
-    │   Normal: card body                                             │
-    └─────────────────────────────────────────────────────────────────┘
+    We reconstruct logical lines by grouping characters that share the same
+    y-position (within a small tolerance), then classify each line as:
+      heading-1  font_size >= 16
+      heading-2  font_size >= 13
+      heading-3  font_size >= 11  (and not body text sized)
+      body       everything else
+
+    Highlight detection: pdfplumber exposes page annotations.  We collect
+    all Highlight-type annotation rectangles, then for each word we check
+    whether its bounding box overlaps any highlight rect.
+
+    Bold detection: font name contains one of the bold marker strings below.
+    Underline: checked via annotation type OR font name containing "Underline".
+
+    Because PDF text may carry inconsistent formatting (some teams export
+    highlight-only, bold-only, etc.) the same promotion rules apply:
+      highlighted  →  bold + underline + size 11 (read-aloud tier)
+      bold+ul      →  size 11
+      underline    →  size 11
+      plain        →  size 8
     """
     try:
-        doc = Document(io.BytesIO(docx_bytes))
+        import pdfplumber
+    except ImportError:
+        print("    [!] pdfplumber not installed — pip install pdfplumber")
+        return []
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    _BOLD_MARKERS = ('bold', 'heavy', 'black', 'demi', 'semibold', 'extrabold')
+
+    def _font_is_bold(fontname: str) -> bool:
+        fn = (fontname or '').lower()
+        return any(m in fn for m in _BOLD_MARKERS)
+
+    def _rects_overlap(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1, tol=2) -> bool:
+        """True if two rectangles overlap (with tolerance in pts)."""
+        return (ax0 < bx1 + tol and ax1 > bx0 - tol and
+                ay0 < by1 + tol and ay1 > by0 - tol)
+
+    def _gather_highlights(page) -> list:
+        """
+        Return list of (x0, top, x1, bottom) highlight rects from annotations.
+        Covers both Highlight and Underline annotation subtypes.
+        """
+        rects = []
+        try:
+            annots = page.annots or []
+        except Exception:
+            annots = []
+        for ann in annots:
+            subtype = (ann.get('data', {}) or {}).get('Subtype', '') if isinstance(ann, dict) else ''
+            if not subtype:
+                # pdfplumber newer API
+                try:
+                    subtype = ann.get('Subtype', '')
+                except Exception:
+                    pass
+            if subtype in ('Highlight', 'Underline', 'StrikeOut', 'Squiggly'):
+                try:
+                    r = ann.get('rect') or ann.get('data', {}).get('Rect')
+                    if r and len(r) == 4:
+                        # PDF rect is (x0, y0, x1, y1) in PDF coords (bottom-up)
+                        # pdfplumber converts to top-down automatically in .rect
+                        x0, y0, x1, y1 = r
+                        rects.append((min(x0, x1), min(y0, y1),
+                                      max(x0, x1), max(y0, y1)))
+                except Exception:
+                    pass
+        return rects
+
+    def _word_is_highlighted(word, hl_rects) -> bool:
+        if not hl_rects:
+            return False
+        wx0 = word.get('x0', 0)
+        wx1 = word.get('x1', 0)
+        wy0 = word.get('top', 0)
+        wy1 = word.get('bottom', 0)
+        return any(_rects_overlap(wx0, wy0, wx1, wy1, *r) for r in hl_rects)
+
+    # ── Group words into lines ────────────────────────────────────────────────
+    def _words_to_lines(words, hl_rects, tol=2):
+        """
+        Cluster words by their top y-coordinate (within tol pts) into lines.
+        Each line is a list of word dicts sorted left-to-right, augmented with
+        'highlighted' and 'bold' flags.
+        """
+        if not words:
+            return []
+        buckets = []
+        for w in sorted(words, key=lambda x: (x.get('top', 0), x.get('x0', 0))):
+            placed = False
+            for bucket in buckets:
+                if abs(bucket[0].get('top', 0) - w.get('top', 0)) <= tol:
+                    bucket.append(w)
+                    placed = True
+                    break
+            if not placed:
+                buckets.append([w])
+
+        lines = []
+        for bucket in sorted(buckets, key=lambda b: b[0].get('top', 0)):
+            for w in bucket:
+                w['highlighted'] = _word_is_highlighted(w, hl_rects)
+                w['bold']        = _font_is_bold(w.get('fontname', ''))
+            lines.append(bucket)
+        return lines
+
+    # ── Line → rich text string ───────────────────────────────────────────────
+    def _line_to_rich(line_words):
+        """
+        Convert a line (list of word dicts) to a ReportLab rich-text string.
+        Applies the same three-tier formatting rules as the docx path.
+        """
+        # Rebuild into runs of consistent formatting to minimise tag clutter
+        # For PDFs we treat each word as its own run (word-level granularity)
+        full_text = ' '.join(w.get('text', '') for w in line_words)
+
+        # Citation detection on the assembled line text
+        stripped   = full_text.lstrip()
+        leading_ws = len(full_text) - len(stripped)
+        cite_m     = _CITE_TAG_RE.match(stripped)
+        cite_end   = (leading_ws + cite_m.end(1)) if cite_m else 0
+
+        parts    = []
+        char_pos = 0
+
+        for wi, w in enumerate(line_words):
+            raw_text = w.get('text', '')
+            if not raw_text:
+                char_pos += len(raw_text) + 1   # +1 for the space separator
+                continue
+
+            # Add a leading space between words (except the first)
+            if wi > 0:
+                parts.append(_format_run_fragment(' ', size=SZ_FILLER))
+                char_pos += 1
+
+            hl    = w.get('highlighted', False)
+            bold  = w.get('bold', False)
+            # PDF underline: check if there is a separate underline annotation
+            # (we treat it same as highlight for simplicity; most debate docs
+            #  use highlight as the primary markup in PDF exports)
+            underline = hl   # promoted below anyway
+
+            word_start = char_pos
+            word_end   = char_pos + len(raw_text)
+
+            if cite_end > 0 and word_start < cite_end:
+                # Citation zone → always bold size 11
+                parts.append(_format_run_fragment(
+                    raw_text, bold=True, underline=False,
+                    highlight_bg=None, size=SZ_READ))
+            elif hl:
+                # Highlighted → read-aloud tier (bold + underline + size 11)
+                parts.append(_format_run_fragment(
+                    raw_text, bold=True, underline=True,
+                    highlight_bg=_HIGHLIGHT_COLORS.get('YELLOW', '#cce8ff'),
+                    size=SZ_READ))
+            elif bold:
+                # Bold-only → still size 11, no underline
+                parts.append(_format_run_fragment(
+                    raw_text, bold=True, underline=False,
+                    highlight_bg=None, size=SZ_READ))
+            else:
+                parts.append(_format_run_fragment(
+                    raw_text, bold=False, underline=False,
+                    highlight_bg=None, size=SZ_FILLER))
+
+            char_pos = word_end
+
+        return ''.join(parts)
+
+    # ── Infer heading level from font size ────────────────────────────────────
+    def _line_heading_level(line_words):
+        if not line_words:
+            return None
+        # Use the maximum font size in the line
+        sizes = []
+        for w in line_words:
+            try:
+                sizes.append(float(w.get('size', 0) or 0))
+            except Exception:
+                pass
+        if not sizes:
+            return None
+        sz = max(sizes)
+        if sz >= 16:
+            return 1
+        if sz >= 13:
+            return 2
+        if sz >= 11.5:
+            return 3
+        return None   # body text
+
+    # ── Main extraction loop ──────────────────────────────────────────────────
+    blocks        = []
+    in_rebuttal   = False
+    in_defense    = False
+    current_name  = None
+    current_lines = []
+
+    def flush():
+        nonlocal current_name, current_lines
+        if current_name and current_lines:
+            blocks.append({
+                'arg_name': current_name,
+                'lines':    current_lines[:],
+                'source':   source_meta,
+            })
+        current_name  = None
+        current_lines = []
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                hl_rects = _gather_highlights(page)
+                words    = page.extract_words(
+                    extra_attrs=['fontname', 'size'],
+                    keep_blank_chars=False,
+                    use_text_flow=True,
+                )
+                lines = _words_to_lines(words, hl_rects)
+
+                for line_words in lines:
+                    text  = ' '.join(w.get('text', '') for w in line_words).strip()
+                    level = _line_heading_level(line_words)
+
+                    if not text:
+                        continue
+
+                    # ── Heading: check for section transitions ────────────────
+                    if level is not None:
+                        def _section_transition_pdf(t):
+                            if _AT_PREFIX_RE.match(t) or _A2_NOCOLON_RE.match(t):
+                                return None
+                            if _DEFENSE_SECTION_RE.match(t):
+                                return 'defense'
+                            if _REBUTTAL_SPEECH_RE.match(t):
+                                return 'rebuttal'
+                            if _CONSTRUCTIVE_SPEECH_RE.match(t):
+                                return 'constructive'
+                            return None
+
+                        trans = _section_transition_pdf(text)
+                        if trans == 'defense':
+                            flush(); in_rebuttal = True; in_defense = True; continue
+                        if trans == 'rebuttal':
+                            flush(); in_rebuttal = True; in_defense = False; continue
+                        if trans == 'constructive':
+                            flush(); in_rebuttal = False; in_defense = False; continue
+
+                        if in_rebuttal and level in (2, 3):
+                            arg = _try_get_block_name(text)
+                            if arg:
+                                flush()
+                                current_name = arg
+                            elif in_defense:
+                                name = _TAIL_JUNK_RE.sub('', text).strip().rstrip('-–— ').strip()
+                                if name:
+                                    flush()
+                                    current_name = name
+                            continue
+
+                        if in_rebuttal and level == 4 and current_name:
+                            safe = _xml_escape(text)
+                            current_lines.append(f'<font size="10"><b>{safe}</b></font>')
+                            continue
+
+                        continue   # other heading levels in non-rebuttal mode
+
+                    # ── Body text ─────────────────────────────────────────────
+                    if not in_rebuttal:
+                        # Flat-file style: bare speech label in body text
+                        if _REBUTTAL_SPEECH_RE.fullmatch(text):
+                            flush(); in_rebuttal = True; in_defense = False; continue
+                        if _CONSTRUCTIVE_SPEECH_RE.match(text):
+                            flush(); in_rebuttal = False; in_defense = False; continue
+                        continue
+
+                    # AT: in flat body text
+                    arg = _try_get_block_name(text)
+                    if arg:
+                        flush()
+                        current_name = arg
+                        continue
+
+                    if current_name:
+                        rich = _line_to_rich(line_words)
+                        if rich.strip():
+                            current_lines.append(rich)
+
+    except Exception as e:
+        print(f"    [!] PDF parse error: {e}")
+
+    flush()
+    return blocks
+
+
+def extract_blocks(file_bytes, source_meta, file_type='docx'):
+    """
+    Dispatcher: routes to the docx or PDF extractor based on file_type.
+    file_type is 'docx' or 'pdf' (as returned by download_file).
+    """
+    if file_type == 'pdf':
+        return extract_blocks_pdf(file_bytes, source_meta)
+
+    # ── docx path ────────────────────────────────────────────────────────────
+    try:
+        doc = Document(io.BytesIO(file_bytes))
     except Exception as e:
         print(f"    [!] Parse error: {e}")
         return []
 
     blocks        = []
-    in_rebuttal   = False   # True when inside a rebuttal speech / defense section
-    in_defense    = False   # True when inside a Defense/Extensions section
+    in_rebuttal   = False
+    in_defense    = False
     current_name  = None
     current_lines = []
 
@@ -625,15 +1181,6 @@ def extract_blocks(docx_bytes, source_meta):
         current_lines = []
 
     def _section_transition(text):
-        """
-        Given heading text, return ('rebuttal'|'constructive'|'defense'|None)
-        to indicate what mode this heading triggers.
-
-        IMPORTANT: AT: block patterns take priority over speech-label patterns
-        so that headings like "2AC---AT: Illegal Betting" are treated as block
-        names rather than speech section labels.
-        """
-        # AT: patterns take priority — "2AC---AT: X" is a block, not a transition
         if _AT_PREFIX_RE.match(text) or _A2_NOCOLON_RE.match(text):
             return None
         if _DEFENSE_SECTION_RE.match(text):
@@ -651,7 +1198,6 @@ def extract_blocks(docx_bytes, source_meta):
         if not text:
             continue
 
-        # ── Any heading level: check for speech / section boundary ────────────
         if level is not None:
             transition = _section_transition(text)
             if transition == 'defense':
@@ -670,9 +1216,7 @@ def extract_blocks(docx_bytes, source_meta):
                 in_defense  = False
                 continue
 
-        # ── Normal text: handle flat-file speech labels ────────────────────────
         if level is None and not in_rebuttal:
-            # A bare "2AC" / "2NC" on its own line in a Normal paragraph
             if _REBUTTAL_SPEECH_RE.fullmatch(text):
                 flush()
                 in_rebuttal = True
@@ -687,45 +1231,35 @@ def extract_blocks(docx_bytes, source_meta):
         if not in_rebuttal:
             continue
 
-        # ── Heading 2 or 3: block name detection ─────────────────────────────
         if level in (2, 3):
             arg = _try_get_block_name(text)
             if arg:
-                # Explicit AT: prefix — start new block regardless of mode
                 flush()
                 current_name = arg
             elif in_defense:
-                # Defense mode: any non-trivial heading is a block name
                 name = _TAIL_JUNK_RE.sub("", text).strip().rstrip("-–— ").strip()
                 if name:
                     flush()
                     current_name = name
-            # else: group label (e.g., "Neg Answers", "States") — skip
             continue
 
-        # ── Heading 4: card tag or block name (depends on mode) ───────────────
         if level == 4:
             if in_defense:
-                # In defense mode, H4 starts a new block (Fairmont Prep style)
                 name = _TAIL_JUNK_RE.sub("", text).strip().rstrip("-–— ").strip()
                 if name:
                     flush()
                     current_name = name
             elif current_name:
-                # Standard mode: H4 is a card sub-header inside the current block
                 safe = _xml_escape(text)
                 current_lines.append(f'<font size="10"><b>{safe}</b></font>')
             continue
 
-        # ── Normal text: AT: in flat files, or card body ──────────────────────
         if level is None:
-            # Check for AT: prefix in Normal text (Style D — flat docs)
             arg = _try_get_block_name(text)
             if arg:
                 flush()
                 current_name = arg
                 continue
-            # Card body text
             if current_name:
                 rich = _para_to_rich(para)
                 if rich.strip():
@@ -740,6 +1274,18 @@ def extract_blocks(docx_bytes, source_meta):
 
 def _normalize(name):
     return re.sub(r'\s+', ' ', name.lower().strip())
+
+
+def _block_fingerprint(blk):
+    """
+    Stable fingerprint for a block — used to deduplicate cards that appear
+    multiple times (e.g. same AT: block in both 2NC and Defense sections of
+    the same file, or the same file downloaded under two different round entries).
+    Uses: source file path + first 120 chars of joined card text.
+    """
+    src_path = blk["source"].get("opensource", "")
+    content  = " ".join(blk["lines"])[:120]
+    return hashlib.md5(f"{src_path}|{blk['arg_name']}|{content}".encode()).hexdigest()
 
 
 def group_by_argument(all_blocks):
@@ -762,7 +1308,19 @@ def group_by_argument(all_blocks):
         if not placed:
             canonical[key] = raw[key]
 
-    return dict(sorted(canonical.items(), key=lambda kv: -len(kv[1])))
+    # Deduplicate blocks within each argument group by content fingerprint
+    deduped = {}
+    for arg, blocks in canonical.items():
+        seen_fps = set()
+        unique   = []
+        for blk in blocks:
+            fp = _block_fingerprint(blk)
+            if fp not in seen_fps:
+                seen_fps.add(fp)
+                unique.append(blk)
+        deduped[arg] = unique
+
+    return dict(sorted(deduped.items(), key=lambda kv: -len(kv[1])))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -811,37 +1369,25 @@ def _build_styles():
     def add(name, parent="Normal", **kw):
         S[name] = ParagraphStyle(name, parent=base[parent], **kw)
 
-    # Cover
     add("CoverTitle", fontSize=34, fontName=FONT_BOLD,
         textColor=C_BLUE, alignment=TA_CENTER, leading=42, spaceAfter=6)
     add("CoverSub",   fontSize=18, fontName=FONT_NORMAL,
         textColor=C_MUTED, alignment=TA_CENTER, leading=24, spaceAfter=6)
     add("CoverMeta",  fontSize=11, fontName=FONT_NORMAL,
         textColor=C_MUTED, alignment=TA_CENTER, leading=19, spaceAfter=2)
-
-    # TOC
     add("TOCTitle",   fontSize=20, fontName=FONT_BOLD,
         textColor=C_BLUE, spaceAfter=10)
-
-    # Section heading (triggers TOC registration)
     add("ArgHeading", fontSize=14, fontName=FONT_BOLD,
         textColor=white, leading=20, spaceBefore=14, spaceAfter=4,
         backColor=C_BLUE, leftIndent=-4, rightIndent=-4,
         borderPad=(4, 10, 4, 10))
-
-    # Block source attribution
     add("SrcLine",    fontSize=9, fontName=FONT_BOLD,
         textColor=C_BLUE, leading=13, spaceBefore=10, spaceAfter=1)
     add("SrcMeta",    fontSize=8, fontName=FONT_NORMAL,
         textColor=C_LIGHT, leading=12, spaceAfter=4)
-
-    # Card tag line (Heading 4)
     add("CardTag",    fontSize=10, fontName=FONT_BOLD,
         textColor=C_MUTED, leading=14, spaceBefore=5, spaceAfter=1,
         backColor=C_TAG_BG, leftIndent=6, borderPad=(2, 6, 2, 6))
-
-    # Card body — base style; actual sizes come from inline <font size="N"> tags
-    # Default is filler size (8), with read/context portions inline at size 11
     add("CardBody",   fontSize=8, fontName=FONT_NORMAL,
         textColor=C_MUTED, leading=13, spaceAfter=1, alignment=TA_JUSTIFY)
 
@@ -924,7 +1470,6 @@ def build_pdf(grouped, targets, tournaments, slug, out_path, blockfile_type=""):
 
             body = []
             for line in blk["lines"]:
-                # Detect card tag lines (wrapped in bold font tag by extractor)
                 is_tag = (line.startswith('<font size="10"><b>') and
                           line.endswith('</b></font>') and
                           len(line) < 600)
@@ -932,14 +1477,12 @@ def build_pdf(grouped, targets, tournaments, slug, out_path, blockfile_type=""):
                 try:
                     body.append(Paragraph(line, style))
                 except Exception:
-                    # Strip all tags as fallback
                     plain = re.sub(r'<[^>]+>', '', line)
                     if plain.strip():
                         body.append(Paragraph(_xml_escape(plain), S["CardBody"]))
 
             body.append(Spacer(1, 0.10*inch))
 
-            # Keep attribution + first few card lines together on same page
             story.append(KeepTogether(hdr + body[:5]))
             for e in body[5:]:
                 story.append(e)
@@ -971,7 +1514,6 @@ def main():
     team_data = resolve_targets(mode, spec)
     if not team_data:
         print("\n[!] No targets resolved.")
-        print("    Check: team name spelling, CASELIST_TOKEN expiry, tournament filter.")
         return
 
     print(f"\n  {len(team_data)} team(s) resolved")
@@ -1009,13 +1551,13 @@ def main():
         side  = meta.get("side", "").upper()
         side_label = "AFF" if side == "A" else ("NEG" if side == "N" else "???")
         print(f"  [{i:3d}/{len(all_metas)}]  {meta['school']}/{meta['team']}  ·  {side_label}  ·  {tourn}")
-        data = download_file(meta["opensource"])
+        data, file_type = download_file(meta["opensource"])
         if not data:
             failed += 1
             continue
         tournaments_seen.add(tourn)
-        blocks = extract_blocks(data, meta)
-        print(f"           -> {len(blocks)} block(s) extracted")
+        blocks = extract_blocks(data, meta, file_type=file_type)
+        print(f"           -> {len(blocks)} block(s) extracted  [{file_type}]")
         all_blocks.extend(blocks)
 
     print(f"\n  {len(all_blocks)} total blocks from {len(all_metas)-failed} files")
@@ -1024,16 +1566,11 @@ def main():
 
     if not all_blocks:
         print("\n[!] No blocks found.")
-        print("    The files may not have 2AC/2NC sections with AT: headings.")
         return
 
-    # ── Split blocks by round side ────────────────────────────────────────────
-    # Team ran AFF  → their blocks answer NEG arguments  → AT: NEG blockfile
-    # Team ran NEG  → their blocks answer AFF arguments  → AT: AFF blockfile
-    # Unknown side  → included in both as a fallback
-    aff_blocks  = []   # AT: NEG (team was AFF)
-    neg_blocks  = []   # AT: AFF (team was NEG)
-    unk_blocks  = []   # side unknown
+    aff_blocks = []
+    neg_blocks = []
+    unk_blocks = []
 
     for blk in all_blocks:
         side = blk["source"].get("side", "").upper()
@@ -1058,41 +1595,28 @@ def main():
 
     outputs = []
 
-    # ── AT: NEG blockfile (from AFF rounds) ──────────────────────────────────
     if aff_blocks:
         print(f"\nGrouping AT: NEG blocks ({len(aff_blocks)} blocks from AFF rounds)...")
         grouped_neg = group_by_argument(aff_blocks)
         print(f"  {len(grouped_neg)} unique argument(s)")
-        for arg, blks in list(grouped_neg.items())[:20]:
-            print(f"    AT: NEG  {arg:<40s}  {len(blks)} block(s)")
-        if len(grouped_neg) > 20:
-            print(f"    ... and {len(grouped_neg)-20} more")
         out_neg = OUTPUT_DIR / f"blockfile_{slug}_AT_NEG.pdf"
         print(f"\nBuilding AT: NEG PDF -> {out_neg.name}")
-        build_pdf(grouped_neg, targets, tournaments_seen, slug, out_neg,
-                  blockfile_type="AT: NEG")
+        build_pdf(grouped_neg, targets, tournaments_seen, slug, out_neg, blockfile_type="AT: NEG")
         outputs.append(("AT: NEG", out_neg, len(grouped_neg), len(aff_blocks)))
     else:
         print("\n  [!] No AFF-side rounds found — AT: NEG blockfile skipped.")
 
-    # ── AT: AFF blockfile (from NEG rounds) ──────────────────────────────────
     if neg_blocks:
         print(f"\nGrouping AT: AFF blocks ({len(neg_blocks)} blocks from NEG rounds)...")
         grouped_aff = group_by_argument(neg_blocks)
         print(f"  {len(grouped_aff)} unique argument(s)")
-        for arg, blks in list(grouped_aff.items())[:20]:
-            print(f"    AT: AFF  {arg:<40s}  {len(blks)} block(s)")
-        if len(grouped_aff) > 20:
-            print(f"    ... and {len(grouped_aff)-20} more")
         out_aff = OUTPUT_DIR / f"blockfile_{slug}_AT_AFF.pdf"
         print(f"\nBuilding AT: AFF PDF -> {out_aff.name}")
-        build_pdf(grouped_aff, targets, tournaments_seen, slug, out_aff,
-                  blockfile_type="AT: AFF")
+        build_pdf(grouped_aff, targets, tournaments_seen, slug, out_aff, blockfile_type="AT: AFF")
         outputs.append(("AT: AFF", out_aff, len(grouped_aff), len(neg_blocks)))
     else:
         print("\n  [!] No NEG-side rounds found — AT: AFF blockfile skipped.")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     print()
     print("="*62)
     print(f"  DONE!")
