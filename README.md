@@ -38,10 +38,10 @@ I coded this tool because I saw my debate event(public forum) was heavily relian
 6. Merge them into one formatted output packet
 7. Save the result as DOCX or PDF
 
-**##Installation**
+## Installation
 pip install requests python-docx docx2pdf
 
-**##Usage**
+## Usage
 Open the script and replace:
 
 CASELIST_TOKEN = "REPLACE_ME_WITH_YOUR_TOKEN"
